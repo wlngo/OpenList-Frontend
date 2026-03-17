@@ -41,7 +41,7 @@ export const players: {
   {
     icon: "vlc",
     name: "VLC",
-    scheme: "vlc://$durl",
+    scheme: "intent:$durl#Intent;package=org.videolan.vlc;end",
     platforms: ["Windows", "MacOS", "Linux", "Android", "iOS"],
   },
   {

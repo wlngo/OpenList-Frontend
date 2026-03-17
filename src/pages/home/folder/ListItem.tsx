@@ -90,6 +90,17 @@ export const ListItem = (props: { obj: StoreObj; index: number }) => {
         }}
         on:click={(e: MouseEvent) => {
           e.preventDefault()
+          // 1. 如果是图片，优先触发画廊预览 (新增逻辑)
+          if (
+            props.obj.type === ObjType.IMAGE &&
+            !e.ctrlKey &&
+            !e.metaKey &&
+            !e.shiftKey &&
+            restoreSelectionCache()
+          ) {
+            bus.emit("gallery", props.obj.name)
+            return // 触发预览后直接返回，不走下面的路由跳转
+          }
           if (openWithDoubleClick()) return
           if (e.ctrlKey || e.metaKey || e.shiftKey) return
           if (!restoreSelectionCache()) return
