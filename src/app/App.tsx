@@ -24,6 +24,7 @@ const Home = lazy(() => import("~/pages/home/Layout"))
 const Manage = lazy(() => import("~/pages/manage"))
 const Login = lazy(() => import("~/pages/login"))
 const Test = lazy(() => import("~/pages/test"))
+const MediaView = lazy(() => import("~/pages/home/MediaView"))
 
 const App: Component = () => {
   const t = useT()
@@ -83,6 +84,22 @@ const App: Component = () => {
           <Routes base={base_path}>
             <Route path="/@test" component={Test} />
             <Route path="/@login" component={Login} />
+            <Route
+              path="/@media/*"
+              element={
+                <MustUser>
+                  <MediaView />
+                </MustUser>
+              }
+            />
+            <Route
+              path="/@s/@media/*"
+              element={
+                <UserOrGuest>
+                  <MediaView />
+                </UserOrGuest>
+              }
+            />
             <Route
               path="/@manage/*"
               element={

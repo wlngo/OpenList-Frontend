@@ -1,5 +1,6 @@
 import {
   HStack,
+  IconButton,
   useColorModeValue,
   Image,
   Center,
@@ -11,15 +12,18 @@ import { changeColor } from "seemly"
 import { Show, createMemo } from "solid-js"
 import { getMainColor, getSetting, local, objStore, State } from "~/store"
 import { BsSearch } from "solid-icons/bs"
+import { FiGrid } from "solid-icons/fi"
 import { CenterLoading } from "~/components"
 import { Container } from "../Container"
 import { bus } from "~/utils"
 import { Layout } from "./layout"
 import { isMac } from "~/utils/compatibility"
+import { useRouter } from "~/hooks"
 
 export const Header = () => {
   const logos = getSetting("logo").split("\n")
   const logo = useColorModeValue(logos[0], logos.pop())
+  const { pathname, to } = useRouter()
 
   const stickyProps = createMemo<CenterProps>(() => {
     switch (local["position_of_header_navbar"]) {
@@ -80,6 +84,21 @@ export const Header = () => {
                   </HStack>
                 </HStack>
               </Show>
+              <IconButton
+                color={getMainColor()}
+                bgColor={changeColor(getMainColor(), { alpha: 0.15 })}
+                _hover={{
+                  bgColor: changeColor(getMainColor(), { alpha: 0.2 }),
+                }}
+                aria-label="media view"
+                compact
+                size="lg"
+                icon={<FiGrid />}
+                mr="$1"
+                onClick={() => {
+                  to(`/@media${pathname()}`)
+                }}
+              />
               <Layout />
             </Show>
           </HStack>
