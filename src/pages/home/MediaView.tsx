@@ -19,6 +19,7 @@ import {
   Spinner,
   Tooltip,
   Kbd,
+  useColorModeValue,
 } from "@hope-ui/solid"
 import {
   BsArrowLeft,
@@ -44,6 +45,7 @@ import { useRouter } from "~/hooks"
 import { password } from "~/store"
 import { ObjType } from "~/types"
 import { fsList, handleRespWithoutNotify, ext, pathJoin, notify } from "~/utils"
+import { isMobile } from "~/utils/compatibility"
 import { getLinkByDirAndObj } from "~/hooks/useLink"
 import "~/components/markdown.css"
 
@@ -159,6 +161,15 @@ const formatSize = (bytes: number): string => {
 
 const MediaView = () => {
   const { pathname, isShare, to } = useRouter()
+
+  const glassBg = useColorModeValue(
+    "rgba(255,255,255,0.72)",
+    "rgba(20,22,26,0.72)",
+  )
+  const glassBorder = useColorModeValue(
+    "rgba(0,0,0,0.06)",
+    "rgba(255,255,255,0.08)",
+  )
 
   const rawPath = pathname()
   const prefix = rawPath.startsWith("/@s")
@@ -650,10 +661,15 @@ const MediaView = () => {
     >
       {/* ═══════ Top Bar ═══════ */}
       <Box
-        bg="$neutral2"
-        borderBottom="1px solid $neutral6"
         flexShrink={0}
         zIndex={10}
+        bg={glassBg()}
+        borderBottom={`1px solid ${glassBorder()}`}
+        css={{
+          backdropFilter: "blur(14px) saturate(160%)",
+          WebkitBackdropFilter: "blur(14px) saturate(160%)",
+          boxShadow: "0 1px 0 rgba(0,0,0,0.02), 0 6px 20px rgba(0,0,0,0.05)",
+        }}
       >
         <Box display="flex" alignItems="center" gap="$2" px="$3" py="$2">
           <IconButton
@@ -719,7 +735,7 @@ const MediaView = () => {
           pb="$2"
           flexWrap="wrap"
         >
-          <InputGroup size="sm" w="220px" flexShrink={0}>
+          <InputGroup size="sm" w={isMobile ? "100%" : "220px"} flexShrink={0}>
             <InputLeftElement pointerEvents="none">
               <Box as={AiOutlineSearch} color="$neutral11" />
             </InputLeftElement>
@@ -729,7 +745,7 @@ const MediaView = () => {
               onInput={(e) => setSearch(e.currentTarget.value)}
             />
           </InputGroup>
-          <Box flex={1} />
+          {!isMobile && <Box flex={1} />}
           <Tooltip
             label={`Recursive: ${recursive() ? "ON" : "OFF"} (depth ${maxDepth()}) — double-click to change depth`}
             placement="bottom"
@@ -886,20 +902,24 @@ const MediaView = () => {
                         <Box
                           ref={cardEl}
                           data-media-card={idx().toString()}
-                          rounded="$lg"
+                          rounded="$xl"
                           overflow="hidden"
                           cursor="pointer"
-                          border="2px solid"
-                          borderColor={focused() ? "$primary8" : "$neutral5"}
-                          bg="$neutral2"
+                          border="1px solid"
+                          borderColor={focused() ? "$primary7" : "$neutral6"}
+                          bg="$neutral1"
                           mb="$3"
-                          transition="border-color 0.15s"
+                          transition="transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease"
                           boxShadow={
                             focused()
-                              ? "0 0 0 3px $colors$primary4"
-                              : "0 1px 4px $colors$neutral6"
+                              ? "0 0 0 3px $colors$primary4, 0 8px 22px $colors$neutral6"
+                              : "0 1px 3px $colors$neutral7"
                           }
-                          _hover={{ borderColor: "$primary7" }}
+                          _hover={{
+                            transform: "translateY(-2px)",
+                            boxShadow: "0 10px 24px $colors$neutral6",
+                            borderColor: "$primary6",
+                          }}
                           onClick={() => openLightbox(idx())}
                           onMouseEnter={() => setFocusIndex(idx())}
                         >
@@ -925,9 +945,8 @@ const MediaView = () => {
                               color="$neutral12"
                               flex={1}
                               css={{
-                                whiteSpace: "nowrap",
-                                overflow: "hidden",
-                                textOverflow: "ellipsis",
+                                wordBreak: "break-all",
+                                lineHeight: "1.35",
                               }}
                             >
                               {item.name}
@@ -995,8 +1014,9 @@ const MediaView = () => {
                     <Box
                       css={{
                         display: "grid",
-                        "grid-template-columns":
-                          "repeat(auto-fill, minmax(180px, 1fr))",
+                        "grid-template-columns": isMobile
+                          ? "repeat(auto-fill, minmax(150px, 1fr))"
+                          : "repeat(auto-fill, minmax(180px, 1fr))",
                         gap: "10px",
                       }}
                     >
@@ -1005,38 +1025,43 @@ const MediaView = () => {
                           const idx = () => getIndex(item)
                           const focused = () => focusIndex() === idx()
                           const link = () => getItemLink(item)
-                          const thumbUrl = () =>
-                            item.thumb ||
-                            (item.type === "image" || item.type === "gif"
-                              ? link()
-                              : "")
+                          const thumbUrl = () => {
+                            if (item.type === "gif") return link()
+                            if (item.type === "image")
+                              return item.thumb || link()
+                            return ""
+                          }
 
                           return (
                             <Box
                               data-media-card={idx().toString()}
-                              rounded="$lg"
+                              rounded="$xl"
                               overflow="hidden"
                               cursor="pointer"
-                              border="2px solid"
+                              border="1px solid"
                               borderColor={
-                                focused() ? "$primary8" : "$neutral6"
+                                focused() ? "$primary7" : "$neutral6"
                               }
-                              bg="$neutral2"
-                              transition="border-color 0.15s"
+                              bg="$neutral1"
+                              transition="transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease"
                               boxShadow={
                                 focused()
-                                  ? "0 0 0 3px $colors$primary4"
+                                  ? "0 0 0 3px $colors$primary4, 0 8px 22px $colors$neutral6"
                                   : "0 1px 3px $colors$neutral7"
                               }
-                              _hover={{ borderColor: "$primary7" }}
+                              _hover={{
+                                transform: "translateY(-3px)",
+                                boxShadow: "0 12px 26px $colors$neutral6",
+                                borderColor: "$primary6",
+                              }}
                               onClick={() => openLightbox(idx())}
                               onMouseEnter={() => setFocusIndex(idx())}
                             >
                               <Box
-                                h="140px"
                                 bg="$neutral4"
                                 pos="relative"
                                 overflow="hidden"
+                                css={{ aspectRatio: "4 / 3" }}
                               >
                                 <Show
                                   when={
@@ -1099,14 +1124,11 @@ const MediaView = () => {
                               <Box p="$2">
                                 <Text
                                   size="xs"
-                                  fontWeight="$medium"
+                                  fontWeight="$semibold"
+                                  color="$neutral12"
                                   css={{
-                                    display: "-webkit-box",
-                                    "-webkit-line-clamp": "2",
-                                    "-webkit-box-orient": "vertical",
-                                    overflow: "hidden",
-                                    "word-break": "break-all",
-                                    lineHeight: "1.3",
+                                    wordBreak: "break-all",
+                                    lineHeight: "1.35",
                                   }}
                                 >
                                   {item.name}
@@ -1137,30 +1159,6 @@ const MediaView = () => {
             </Show>
           </Show>
         </Show>
-      </Box>
-
-      {/* ═══════ Bottom Status Bar ═══════ */}
-      <Box
-        bg="$neutral2"
-        borderTop="1px solid $neutral6"
-        px="$3"
-        py="$1_5"
-        display="flex"
-        alignItems="center"
-        gap="$3"
-        flexShrink={0}
-        fontSize="xs"
-        color="$neutral11"
-      >
-        <Text>
-          {flatItems().length} items · {folderGroups().length} folders
-          <Show when={focusIndex() >= 0}> · #{focusIndex() + 1}</Show>
-        </Text>
-        <Box flex={1} />
-        <Kbd>←→↑↓</Kbd> navigate
-        <Kbd>Enter</Kbd> open
-        <Kbd>/</Kbd> jump
-        <Kbd>?</Kbd> help
       </Box>
 
       {/* ═══════ Lightbox ═══════ */}
@@ -1367,40 +1365,42 @@ const MediaView = () => {
                   />
                 </Show>
               </Box>
-              <Box
-                pos="relative"
-                display="flex"
-                justifyContent="center"
-                gap="$4"
-                px="$3"
-                py="$2"
-                zIndex={1}
-              >
-                <Text size="xs" css={{ color: "rgba(255,255,255,0.4)" }}>
-                  <Kbd
-                    css={{
-                      background: "rgba(255,255,255,0.1)",
-                      borderColor: "rgba(255,255,255,0.2)",
-                      color: "rgba(255,255,255,0.6)",
-                    }}
-                  >
-                    ← →
-                  </Kbd>{" "}
-                  prev/next
-                </Text>
-                <Text size="xs" css={{ color: "rgba(255,255,255,0.4)" }}>
-                  <Kbd
-                    css={{
-                      background: "rgba(255,255,255,0.1)",
-                      borderColor: "rgba(255,255,255,0.2)",
-                      color: "rgba(255,255,255,0.6)",
-                    }}
-                  >
-                    Esc
-                  </Kbd>{" "}
-                  close
-                </Text>
-              </Box>
+              <Show when={!isMobile}>
+                <Box
+                  pos="relative"
+                  display="flex"
+                  justifyContent="center"
+                  gap="$4"
+                  px="$3"
+                  py="$2"
+                  zIndex={1}
+                >
+                  <Text size="xs" css={{ color: "rgba(255,255,255,0.4)" }}>
+                    <Kbd
+                      css={{
+                        background: "rgba(255,255,255,0.1)",
+                        borderColor: "rgba(255,255,255,0.2)",
+                        color: "rgba(255,255,255,0.6)",
+                      }}
+                    >
+                      ← →
+                    </Kbd>{" "}
+                    prev/next
+                  </Text>
+                  <Text size="xs" css={{ color: "rgba(255,255,255,0.4)" }}>
+                    <Kbd
+                      css={{
+                        background: "rgba(255,255,255,0.1)",
+                        borderColor: "rgba(255,255,255,0.2)",
+                        color: "rgba(255,255,255,0.6)",
+                      }}
+                    >
+                      Esc
+                    </Kbd>{" "}
+                    close
+                  </Text>
+                </Box>
+              </Show>
             </Box>
           )
         })()}
