@@ -44,7 +44,14 @@ import { FullLoading } from "~/components"
 import { useRouter } from "~/hooks"
 import { password } from "~/store"
 import { ObjType } from "~/types"
-import { fsList, handleRespWithoutNotify, ext, pathJoin, notify } from "~/utils"
+import {
+  fsList,
+  handleRespWithoutNotify,
+  ext,
+  pathJoin,
+  notify,
+  encodePath,
+} from "~/utils"
 import { isMobile } from "~/utils/compatibility"
 import { getLinkByDirAndObj } from "~/hooks/useLink"
 import "~/components/markdown.css"
@@ -677,7 +684,7 @@ const MediaView = () => {
             icon={<BsArrowLeft />}
             variant="ghost"
             size="sm"
-            onClick={() => to(folderPath === "/" ? "/" : folderPath)}
+            onClick={() => to(encodePath(folderPath, true))}
           />
           <Box flex={1} overflow="hidden">
             <Text

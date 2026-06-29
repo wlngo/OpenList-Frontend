@@ -15,7 +15,7 @@ import { BsSearch } from "solid-icons/bs"
 import { FiGrid } from "solid-icons/fi"
 import { CenterLoading } from "~/components"
 import { Container } from "../Container"
-import { bus } from "~/utils"
+import { bus, encodePath } from "~/utils"
 import { Layout } from "./layout"
 import { isMac } from "~/utils/compatibility"
 import { useRouter } from "~/hooks"
@@ -96,7 +96,11 @@ export const Header = () => {
                 icon={<FiGrid />}
                 mr="$1"
                 onClick={() => {
-                  to(`/@media${pathname()}`)
+                  // pathname() is decoded; re-encode so a folder name with a
+                  // trailing space / tab / nbsp / # / ? / % survives pushState.
+                  // encodeURIComponent (all=true) covers every whitespace &
+                  // control char; the URL parser strips raw trailing C0/space.
+                  to(`/@media${encodePath(pathname(), true)}`)
                 }}
               />
               <Layout />
