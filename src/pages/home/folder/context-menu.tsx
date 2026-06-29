@@ -4,18 +4,21 @@ import "solid-contextmenu/dist/style.css"
 import { HStack, Icon, Text, useColorMode, Image } from "@hope-ui/solid"
 import { operations } from "../toolbar/operations"
 import { For, Show } from "solid-js"
-import { bus, convertURL, notify } from "~/utils"
-import { ObjType, UserMethods, UserPermissions } from "~/types"
+import { bus, convertURL, notify, torrentParse } from "~/utils"
+import { ObjType, UserMethods } from "~/types"
 import {
   getSettingBool,
   haveSelected,
   me,
+  objStore,
   oneChecked,
   selectedObjs,
+  userCan,
 } from "~/store"
 import { players } from "../previews/video_box"
 import { BsPlayCircleFill } from "solid-icons/bs"
 import { isArchive } from "~/store/archive"
+import axios from "axios"
 
 const ItemContent = (props: { name: string }) => {
   const t = useT()
@@ -50,13 +53,10 @@ export const ContextMenu = () => {
       theme={colorMode() !== "dark" ? "light" : "dark"}
       style="z-index: var(--hope-zIndices-popover)"
     >
-      <For each={["rename", "move", "copy", "delete", "share"]}>
+      <For each={["rename", "move", "copy", "delete"] as const}>
         {(name) => (
           <Item
-            hidden={() => {
-              const index = UserPermissions.findIndex((item) => item === name)
-              return isShare() || !UserMethods.can(me(), index)
-            }}
+            hidden={!userCan(name) || !objStore.write || isShare()}
             onClick={() => {
               bus.emit("tool", name)
             }}
@@ -66,13 +66,19 @@ export const ContextMenu = () => {
         )}
       </For>
       <Item
+        hidden={!userCan("share") || isShare()}
+        onClick={() => {
+          bus.emit("tool", "share")
+        }}
+      >
+        <ItemContent name="share" />
+      </Item>
+      <Item
         hidden={() => {
-          const index = UserPermissions.findIndex(
-            (item) => item === "decompress",
-          )
           return (
             isShare() ||
-            !UserMethods.can(me(), index) ||
+            !userCan("decompress") ||
+            !objStore.write ||
             selectedObjs().some((o) => o.is_dir) ||
             selectedObjs().some((o) => !isArchive(o.name))
           )
@@ -82,6 +88,51 @@ export const ContextMenu = () => {
         }}
       >
         <ItemContent name="decompress" />
+      </Item>
+      <Item
+        hidden={() => {
+          return (
+            isShare() ||
+            !userCan("offline_download") ||
+            !objStore.write ||
+            !oneChecked() ||
+            selectedObjs().some((o) => o.is_dir) ||
+            !selectedObjs().every((o) =>
+              o.name.toLowerCase().endsWith(".torrent"),
+            )
+          )
+        }}
+        onClick={async () => {
+          const obj = selectedObjs()[0]
+          if (!obj) return
+          try {
+            // 获取 torrent 文件的下载链接并下载内容
+            const link = rawLink(obj, false)
+            const resp = await axios.get(link, { responseType: "arraybuffer" })
+            const buffer = resp.data as ArrayBuffer
+            const bytes = new Uint8Array(buffer)
+            let binary = ""
+            for (let i = 0; i < bytes.byteLength; i++) {
+              binary += String.fromCharCode(bytes[i])
+            }
+            const base64Data = btoa(binary)
+
+            // 调用解析 API
+            const parseResp = await torrentParse(base64Data)
+            if (parseResp.code === 200) {
+              bus.emit("torrent_parsed", {
+                torrentData: base64Data,
+                info: parseResp.data,
+              })
+            } else {
+              notify.error(parseResp.message || "解析 torrent 失败")
+            }
+          } catch (err) {
+            notify.error(`解析 torrent 失败: ${err}`)
+          }
+        }}
+      >
+        <ItemContent name="offline_download_torrent" />
       </Item>
       <Show when={oneChecked()}>
         <Item
