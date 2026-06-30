@@ -1,6 +1,7 @@
 import {
   createSignal,
   createMemo,
+  createEffect,
   onMount,
   onCleanup,
   For,
@@ -14,8 +15,13 @@ import {
   InputLeftElement,
   IconButton,
   Badge,
+  Button,
   Center,
   Image,
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+  PopoverBody,
   Spinner,
   Tooltip,
   Kbd,
@@ -33,13 +39,7 @@ import {
   AiOutlineFolder,
   AiOutlineReload,
 } from "solid-icons/ai"
-import {
-  FiImage,
-  FiFilm,
-  FiType,
-  FiChevronDown,
-  FiChevronRight,
-} from "solid-icons/fi"
+import { FiImage, FiFilm, FiType } from "solid-icons/fi"
 import { FullLoading } from "~/components"
 import { useRouter } from "~/hooks"
 import { password } from "~/store"
@@ -54,6 +54,7 @@ import {
 } from "~/utils"
 import { isMobile } from "~/utils/compatibility"
 import { getLinkByDirAndObj } from "~/hooks/useLink"
+import { createVirtualizer } from "@tanstack/solid-virtual"
 import "~/components/markdown.css"
 
 /* ──────────────────── Types ──────────────────── */
@@ -144,7 +145,8 @@ const TEXT_EXTS = new Set([
   "gitignore",
 ])
 
-const GROUPS_PER_BATCH = 10
+const MIN_CARD_W = 180
+const CARD_GAP = 10
 
 const getMediaType = (name: string): MediaItem["type"] | null => {
   const e = ext(name).toLowerCase()
@@ -178,11 +180,13 @@ const MediaView = () => {
     "rgba(255,255,255,0.08)",
   )
 
-  const rawPath = pathname()
-  const prefix = rawPath.startsWith("/@s")
-    ? rawPath.match(/^\/@s\/@media/)?.[0] || "/@media"
-    : "/@media"
-  const folderPath = rawPath.slice(prefix.length) || "/"
+  const folderPath = createMemo(() => {
+    const rawPath = pathname()
+    const prefix = rawPath.startsWith("/@s")
+      ? rawPath.match(/^\/@s\/@media/)?.[0] || "/@media"
+      : "/@media"
+    return rawPath.slice(prefix.length) || "/"
+  })
 
   /* ─── State ─── */
   const [items, setItems] = createSignal<MediaItem[]>([])
@@ -190,26 +194,62 @@ const MediaView = () => {
   const [scanning, setScanning] = createSignal(false)
   const [scanMsg, setScanMsg] = createSignal("")
   const [search, setSearch] = createSignal("")
-  const [recursive, setRecursive] = createSignal(true)
-  const [maxDepth, setMaxDepth] = createSignal(3)
+  const [subDirs, setSubDirs] = createSignal<string[]>([])
+  const [dirFilter, setDirFilter] = createSignal("")
+  const filteredSubDirs = createMemo(() => {
+    const q = dirFilter().toLowerCase().trim()
+    if (!q) return subDirs()
+    return subDirs().filter((d) =>
+      (d.split("/").pop() || d).toLowerCase().includes(q),
+    )
+  })
   const [focusIndex, setFocusIndex] = createSignal(-1)
   const [lightboxIndex, setLightboxIndex] = createSignal<number | null>(null)
+  const [navDir, setNavDir] = createSignal<"prev" | "next" | "open">("open")
+  // the item currently sliding out during a prev/next transition (TikTok-style)
+  const [outgoing, setOutgoing] = createSignal<{
+    item: MediaItem
+    dir: "prev" | "next"
+  } | null>(null)
   const [showHelp, setShowHelp] = createSignal(false)
   const [showJump, setShowJump] = createSignal(false)
   const [jumpInput, setJumpInput] = createSignal("")
   const [textCache, setTextCache] = createSignal<Record<string, string>>({})
-  const [visibleCount, setVisibleCount] = createSignal(GROUPS_PER_BATCH)
+  const [cols, setCols] = createSignal(isMobile ? 2 : 4)
+  const [containerWidth, setContainerWidth] = createSignal(0)
+  // actual measured row heights (via our own ResizeObserver) — index → px.
+  // Lets variable-height rows (full text) be positioned correctly without
+  // relying on exact estimates.
+  const [measuredHeights, setMeasuredHeights] = createSignal<
+    Record<number, number>
+  >({})
 
   /* ─── Refs ─── */
   let scrollRef: HTMLDivElement | undefined
   let abortCtrl: AbortController | undefined
   let jumpInputRef: HTMLInputElement | undefined
-  let sentinelRef: HTMLDivElement | undefined
+  let resizeObserver: ResizeObserver | undefined
+  let touchStartX = 0
+  let touchStartY = 0
+  let touchMoved = false
+  let touchStartTarget: HTMLElement | null = null
+  let outTimer: ReturnType<typeof setTimeout> | undefined
+  let scanItems: MediaItem[] = []
+  let scanFlushPending = false
+  let scanFlushTimer: ReturnType<typeof setTimeout> | undefined
 
-  const observeSentinel = (el: HTMLDivElement) => {
-    if (sentinelRef) loadMoreObserver?.unobserve(sentinelRef)
-    sentinelRef = el
-    if (hasMore()) loadMoreObserver?.observe(el)
+  // True when the current touch began on the video's bottom control bar, so the
+  // native seek bar can be dragged without triggering a browse swipe.
+  const startedOnVideoControls = () => {
+    const el = touchStartTarget
+    if (!el) return false
+    // The seek bar can surface as an <input> in some browsers.
+    if (el.tagName === "INPUT") return true
+    if (el.tagName !== "VIDEO") return false
+    const r = el.getBoundingClientRect()
+    return (
+      r.height > 0 && touchStartY > r.bottom - Math.max(48, r.height * 0.16)
+    )
   }
 
   /* ─── Computed: filtered flat list ─── */
@@ -219,16 +259,6 @@ const MediaView = () => {
     if (q) result = result.filter((i) => i.name.toLowerCase().includes(q))
     return result
   })
-
-  /* ─── O(1) index lookup map ─── */
-  const indexMap = createMemo(() => {
-    const map = new Map<MediaItem, number>()
-    const flat = filteredItems()
-    for (let i = 0; i < flat.length; i++) map.set(flat[i], i)
-    return map
-  })
-
-  const getIndex = (item: MediaItem) => indexMap().get(item) ?? -1
 
   /* ─── Computed: group by folder, sorted ─── */
   const folderGroups = createMemo<FolderGroup[]>(() => {
@@ -250,10 +280,10 @@ const MediaView = () => {
       })
 
       let displayName: string
-      if (path === folderPath) {
-        displayName = folderPath.split("/").pop() || "/"
+      if (path === folderPath()) {
+        displayName = folderPath() || "/"
       } else {
-        displayName = path.slice(folderPath.length + 1) || path
+        displayName = path.slice(folderPath().length + 1) || path
       }
 
       groups.push({ path, displayName, items: groupItems })
@@ -263,18 +293,153 @@ const MediaView = () => {
     return groups
   })
 
-  /* ─── Progressive rendering: only show visibleCount groups ─── */
-  const visibleGroups = createMemo(() =>
-    folderGroups().slice(0, visibleCount()),
-  )
-  const hasMore = createMemo(() => visibleCount() < folderGroups().length)
+  /* flat list in DISPLAY order (groups → items); drives lightbox + keyboard nav */
+  const flatItems = createMemo(() => {
+    const flat: MediaItem[] = []
+    for (const g of folderGroups()) for (const it of g.items) flat.push(it)
+    return flat
+  })
 
-  const flatItems = createMemo(() => filteredItems())
+  /* O(1) item → display-order index */
+  const indexMap = createMemo(() => {
+    const map = new Map<MediaItem, number>()
+    const flat = flatItems()
+    for (let i = 0; i < flat.length; i++) map.set(flat[i], i)
+    return map
+  })
+  const getIndex = (item: MediaItem) => indexMap().get(item) ?? -1
 
   const currentItem = createMemo(() => {
     const idx = lightboxIndex()
     return idx !== null ? flatItems()[idx] : null
   })
+
+  /* ─── Virtualized rows: flatten groups into Header / CardRow / TextRow ─── */
+  type Row =
+    | { key: string; kind: "header"; group: FolderGroup; est: number }
+    | {
+        key: string
+        kind: "cards"
+        group: FolderGroup
+        items: MediaItem[]
+        est: number
+      }
+    | {
+        key: string
+        kind: "text"
+        group: FolderGroup
+        item: MediaItem
+        est: number
+      }
+
+  /* exact height of a cards row (image aspect + caption + padding) — keeps
+     the virtualizer's estimate correct so image rows never overlap */
+  const cardRowHeight = createMemo(() => {
+    const w = containerWidth()
+    const c = cols()
+    if (w <= 0 || c <= 0) return 210
+    const gridW = Math.max(0, w - 24) // scroll container px=$3 padding
+    const cardW = (gridW - (c - 1) * CARD_GAP) / c
+    return cardW * 0.75 + 62 // rough fallback; real height measured by ResizeObserver
+  })
+
+  const rows = createMemo<Row[]>(() => {
+    const c = cols()
+    const cardEst = cardRowHeight()
+    const out: Row[] = []
+    for (const g of folderGroups()) {
+      out.push({ key: `h:${g.path}`, kind: "header", group: g, est: 48 })
+      const texts = g.items.filter((i) => i.type === "text")
+      const media = g.items.filter((i) => i.type !== "text")
+      for (const t of texts)
+        out.push({
+          key: `t:${g.path}:${t.name}`,
+          kind: "text",
+          group: g,
+          item: t,
+          est: 200,
+        })
+      for (let i = 0; i < media.length; i += c)
+        out.push({
+          key: `c:${g.path}:${i}`,
+          kind: "cards",
+          group: g,
+          items: media.slice(i, i + c),
+          est: cardEst,
+        })
+    }
+    return out
+  })
+
+  /* display-order item index → row index (keyboard nav / lightbox sync) */
+  const itemToRow = createMemo(() => {
+    const m = new Map<number, number>()
+    const flat = flatItems()
+    const itemToFlat = new Map<MediaItem, number>()
+    for (let i = 0; i < flat.length; i++) itemToFlat.set(flat[i], i)
+    const rs = rows()
+    for (let r = 0; r < rs.length; r++) {
+      const row = rs[r]
+      if (row.kind === "cards")
+        for (const it of row.items) m.set(itemToFlat.get(it)!, r)
+      else if (row.kind === "text") m.set(itemToFlat.get(row.item)!, r)
+    }
+    return m
+  })
+
+  /* the virtualizer — only viewport rows are mounted (scales to tens of thousands) */
+  const virtualizer = createVirtualizer({
+    get count() {
+      return rows().length
+    },
+    getScrollElement: () => scrollRef ?? null,
+    estimateSize: (i: number) => measuredHeights()[i] ?? rows()[i]?.est ?? 200,
+    getItemKey: (i: number) => rows()[i]?.key ?? String(i),
+    overscan: 8,
+  })
+
+  /* Our own ResizeObserver measures each rendered row's real height (including
+     full, variable-height text) and feeds it back via estimateSize. Unlike the
+     built-in measureElement it isn't skipped during scroll, so rows mounted
+     while scrolling get measured too (no overlap). */
+  const rowResizeObserver =
+    typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver((entries) => {
+          const updates: Record<number, number> = {}
+          let changed = false
+          const prev = measuredHeights()
+          for (const entry of entries) {
+            const el = entry.target as HTMLElement
+            const idxStr = el.dataset.index
+            if (idxStr == null) continue
+            const idx = parseInt(idxStr, 10)
+            if (Number.isNaN(idx)) continue
+            if (!el.isConnected) {
+              rowResizeObserver?.unobserve(el)
+              continue
+            }
+            const h = el.getBoundingClientRect().height
+            if (h > 0 && prev[idx] !== h) {
+              updates[idx] = h
+              changed = true
+            }
+          }
+          if (changed) {
+            setMeasuredHeights((p) => ({ ...p, ...updates }))
+            virtualizer.measure()
+          }
+        })
+      : undefined
+
+  const recomputeCols = () => {
+    const w = scrollRef?.clientWidth ?? 0
+    if (w > 0) {
+      setContainerWidth(w)
+      const gridW = Math.max(0, w - 24) // px=$3 padding
+      const minW = isMobile ? 150 : MIN_CARD_W
+      setCols(Math.max(1, Math.floor((gridW + CARD_GAP) / (minW + CARD_GAP))))
+    }
+  }
 
   /* ─── Fetch Logic ─── */
   const getItemLink = (item: MediaItem) => {
@@ -295,13 +460,9 @@ const MediaView = () => {
     )
   }
 
-  const fetchFolder = async (
-    path: string,
-    depth: number,
-    maxD: number,
-    signal: AbortSignal,
-  ) => {
+  const fetchFolder = async (path: string, signal: AbortSignal) => {
     if (signal.aborted) return
+    const isRoot = path === folderPath()
     setScanMsg(`Scanning: ${path}`)
 
     const resp = await fsList(path, password(), 1, 0, false)
@@ -318,16 +479,19 @@ const MediaView = () => {
       },
     )
 
-    if (!data?.content) return
+    if (!data?.content) {
+      if (isRoot) setSubDirs([])
+      return
+    }
     const content = data.content as any[]
 
     const newItems: MediaItem[] = []
-    const subDirs: string[] = []
+    const dirs: string[] = []
 
     for (const obj of content) {
       if (signal.aborted) return
       if (obj.is_dir) {
-        subDirs.push(pathJoin(path, obj.name))
+        dirs.push(pathJoin(path, obj.name))
         continue
       }
       const mediaType = getMediaType(obj.name)
@@ -345,32 +509,45 @@ const MediaView = () => {
       }
     }
 
-    if (newItems.length > 0) setItems((prev) => [...prev, ...newItems])
+    // first-level subdirectories (top-level only) power the quick-nav dropdown
+    dirs.sort((a, b) => a.localeCompare(b))
+    if (isRoot) setSubDirs(dirs)
 
-    if (recursive() && depth < maxD) {
-      subDirs.sort((a, b) => a.localeCompare(b))
-      for (const subDir of subDirs) {
-        if (signal.aborted) return
-        await fetchFolder(subDir, depth + 1, maxD, signal)
-      }
+    if (newItems.length > 0) {
+      for (const it of newItems) scanItems.push(it)
+      scheduleScanFlush()
+    }
+
+    // recursive descent — scan all subfolders so every media file under the
+    // path is shown (no depth limit)
+    for (const sub of dirs) {
+      if (signal.aborted) return
+      await fetchFolder(sub, signal)
     }
   }
 
   const startScan = async () => {
     abortCtrl?.abort()
     abortCtrl = new AbortController()
+    scanItems = []
+    scanFlushPending = false
+    clearTimeout(scanFlushTimer)
+    setSubDirs([])
     setItems([])
     setTextCache({})
     setLoading(true)
     setScanning(true)
     setFocusIndex(-1)
-    setVisibleCount(GROUPS_PER_BATCH)
 
     try {
-      await fetchFolder(folderPath, 0, maxDepth(), abortCtrl.signal)
+      await fetchFolder(folderPath(), abortCtrl.signal)
     } catch (e) {
       if (!abortCtrl.signal.aborted) console.error("Media scan error:", e)
     } finally {
+      // final flush so the last batch isn't held back by the throttle
+      clearTimeout(scanFlushTimer)
+      scanFlushPending = false
+      setItems(scanItems.slice())
       setLoading(false)
       setScanning(false)
       setScanMsg("")
@@ -397,23 +574,7 @@ const MediaView = () => {
     }
   }
 
-  /* ─── Lazy render: IntersectionObserver for progressive loading ─── */
-  let loadMoreObserver: IntersectionObserver | undefined
-
-  onMount(() => {
-    loadMoreObserver = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) {
-          if (entry.isIntersecting && hasMore()) {
-            setVisibleCount((c) => c + GROUPS_PER_BATCH)
-          }
-        }
-      },
-      { rootMargin: "200px" },
-    )
-  })
-
-  /* ─── Lazy text observer: fetch text when card scrolls into view ─── */
+  /* ─── Lazy text observer: fetch text when a text card scrolls into view ─── */
   let textObserver: IntersectionObserver | undefined
 
   onMount(() => {
@@ -434,33 +595,75 @@ const MediaView = () => {
     )
   })
 
+  /* ─── Throttled scan flush: batch item updates to avoid re-render churn ─── */
+  const scheduleScanFlush = () => {
+    if (scanFlushPending) return
+    scanFlushPending = true
+    scanFlushTimer = setTimeout(() => {
+      scanFlushPending = false
+      setItems(scanItems.slice())
+    }, 300)
+  }
+
   /* ─── Navigation ─── */
   const navigate = (newIndex: number) => {
     const len = flatItems().length
     if (len === 0) return
     const clamped = Math.max(0, Math.min(newIndex, len - 1))
     setFocusIndex(clamped)
-    const el = scrollRef?.querySelector(
-      `[data-media-card="${clamped}"]`,
-    ) as HTMLElement
-    if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" })
+    const r = itemToRow().get(clamped)
+    if (r !== undefined) virtualizer.scrollToIndex(r, { align: "auto" })
+  }
+
+  // Keep the grid scrolled to the item shown in the lightbox, so closing
+  // returns you to the right place.
+  const syncGridTo = (index: number) => {
+    if (!flatItems()[index]) return
+    setFocusIndex(index)
+    const r = itemToRow().get(index)
+    if (r !== undefined) virtualizer.scrollToIndex(r, { align: "auto" })
+  }
+
+  // scroll the grid to a folder's group header (quick-nav "locate", not navigate)
+  const scrollToFolder = (folder: string) => {
+    const rs = rows()
+    const r = rs.findIndex(
+      (row) => row.kind === "header" && row.group.path === folder,
+    )
+    if (r >= 0) virtualizer.scrollToIndex(r, { align: "start" })
   }
 
   const openLightbox = (index: number) => {
+    clearTimeout(outTimer)
+    setOutgoing(null)
+    setNavDir("open")
     setLightboxIndex(index)
+    setFocusIndex(index)
     const item = flatItems()[index]
     if (item?.type === "text") fetchTextContent(item)
   }
 
-  const closeLightbox = () => setLightboxIndex(null)
+  const closeLightbox = () => {
+    clearTimeout(outTimer)
+    setOutgoing(null)
+    setLightboxIndex(null)
+  }
 
   const lightboxPrev = () => {
     const idx = lightboxIndex()
     if (idx !== null && idx > 0) {
+      const cur = flatItems()[idx]
       const ni = idx - 1
+      // snapshot the item being left so it can slide out while the new one
+      // slides in (dual-layer vertical page-turn, TikTok-style).
+      setOutgoing(cur ? { item: cur, dir: "prev" } : null)
+      setNavDir("prev")
       setLightboxIndex(ni)
+      clearTimeout(outTimer)
+      outTimer = setTimeout(() => setOutgoing(null), 360)
       const item = flatItems()[ni]
       if (item?.type === "text") fetchTextContent(item)
+      syncGridTo(ni)
     }
   }
 
@@ -468,10 +671,16 @@ const MediaView = () => {
     const idx = lightboxIndex()
     const len = flatItems().length
     if (idx !== null && idx < len - 1) {
+      const cur = flatItems()[idx]
       const ni = idx + 1
+      setOutgoing(cur ? { item: cur, dir: "next" } : null)
+      setNavDir("next")
       setLightboxIndex(ni)
+      clearTimeout(outTimer)
+      outTimer = setTimeout(() => setOutgoing(null), 360)
       const item = flatItems()[ni]
       if (item?.type === "text") fetchTextContent(item)
+      syncGridTo(ni)
     }
   }
 
@@ -503,17 +712,17 @@ const MediaView = () => {
     if (lb !== null) {
       switch (e.key) {
         case "ArrowLeft":
-        case "a":
         case "h":
           e.preventDefault()
           lightboxPrev()
           return
         case "ArrowRight":
-        case "d":
         case "l":
           e.preventDefault()
           lightboxNext()
           return
+        case "ArrowUp":
+        case "ArrowDown":
         case "Escape":
           e.preventDefault()
           closeLightbox()
@@ -623,15 +832,28 @@ const MediaView = () => {
   }
 
   /* ─── Lifecycle ─── */
+  // re-scan whenever the folder path changes (quick-nav navigation reuses the
+  // same MediaView instance, so the path is reactive, not a one-shot read)
+  createEffect(() => {
+    folderPath()
+    startScan()
+  })
   onMount(() => {
     window.addEventListener("keydown", onKeyDown)
-    startScan()
+    recomputeCols()
+    if (scrollRef) {
+      resizeObserver = new ResizeObserver(() => recomputeCols())
+      resizeObserver.observe(scrollRef)
+    }
   })
   onCleanup(() => {
     window.removeEventListener("keydown", onKeyDown)
     abortCtrl?.abort()
-    loadMoreObserver?.disconnect()
     textObserver?.disconnect()
+    resizeObserver?.disconnect()
+    rowResizeObserver?.disconnect()
+    clearTimeout(outTimer)
+    clearTimeout(scanFlushTimer)
   })
 
   /* ─── Helpers ─── */
@@ -649,6 +871,291 @@ const MediaView = () => {
         boxSize={props.size || "$4"}
         color={c[props.type]}
       />
+    )
+  }
+
+  /* ─── Render a single virtualized row (header / cards / text) ─── */
+  const renderRow = (row: Row | undefined) => {
+    if (!row) return null
+    if (row.kind === "header") {
+      return (
+        <Box
+          display="flex"
+          alignItems="center"
+          gap="$2"
+          pb="$3"
+          borderBottom="1px solid $neutral5"
+        >
+          <Box
+            as={AiOutlineFolder}
+            boxSize="$5"
+            color="$primary9"
+            flexShrink={0}
+          />
+          <Text
+            size="base"
+            fontWeight="$semibold"
+            color="$neutral12"
+            flex={1}
+            css={{
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              minWidth: "0",
+            }}
+          >
+            {row.group.displayName}
+          </Text>
+          <Badge
+            colorScheme="neutral"
+            variant="subtle"
+            rounded="$full"
+            fontSize="xs"
+          >
+            {row.group.items.length}
+          </Badge>
+        </Box>
+      )
+    }
+    if (row.kind === "text") {
+      const item = row.item
+      const idx = () => getIndex(item)
+      const focused = () => focusIndex() === idx()
+      const textKey = `${item.path}/${item.name}`
+      const content = () => textCache()[textKey]
+      let cardEl: HTMLDivElement | undefined
+      onMount(() => {
+        if (cardEl && textObserver) {
+          cardEl.setAttribute("data-text-key", textKey)
+          textObserver.observe(cardEl)
+        }
+      })
+      return (
+        <Box
+          ref={cardEl}
+          data-media-card={idx().toString()}
+          rounded="$xl"
+          overflow="hidden"
+          cursor="pointer"
+          border="1px solid"
+          borderColor={focused() ? "$primary7" : "$neutral6"}
+          bg="$neutral1"
+          pb="$3"
+          transition="transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease"
+          boxShadow={
+            focused()
+              ? "0 0 0 3px $colors$primary4, 0 8px 22px $colors$neutral6"
+              : "none"
+          }
+          _hover={{
+            transform: "translateY(-2px)",
+            boxShadow: "0 10px 24px $colors$neutral6",
+            borderColor: "$primary6",
+          }}
+          onClick={() => openLightbox(idx())}
+        >
+          <Box
+            display="flex"
+            alignItems="center"
+            gap="$2"
+            px="$4"
+            py="$2_5"
+            borderBottom="1px solid $neutral5"
+            bg="$neutral3"
+          >
+            <Box as={FiType} boxSize="16px" color="$info9" flexShrink={0} />
+            <Text
+              size="sm"
+              fontWeight="$bold"
+              color="$neutral12"
+              flex={1}
+              css={{ wordBreak: "break-all", lineHeight: "1.35" }}
+            >
+              {item.name}
+            </Text>
+            <Text size="xs" color="$neutral10">
+              {formatSize(item.size)}
+            </Text>
+          </Box>
+          <Box px="$4" pt="$3" css={{ userSelect: "text" }}>
+            <Show
+              when={content() !== undefined}
+              fallback={
+                <Box display="flex" alignItems="center" gap="$2" py="$2">
+                  <Spinner size="sm" />
+                  <Text size="xs" color="$neutral10">
+                    Loading…
+                  </Text>
+                </Box>
+              }
+            >
+              <Show
+                when={content()}
+                fallback={
+                  <Text size="sm" color="$neutral9" fontStyle="italic">
+                    (empty file)
+                  </Text>
+                }
+              >
+                <Box
+                  class="markdown-body word-wrap"
+                  as="pre"
+                  m={0}
+                  css={{
+                    whiteSpace: "pre-wrap",
+                    wordBreak: "break-word",
+                    fontSize: "16px",
+                    lineHeight: "1.6",
+                    fontFamily:
+                      "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif",
+                  }}
+                >
+                  {content()}
+                </Box>
+              </Show>
+            </Show>
+          </Box>
+        </Box>
+      )
+    }
+    // cards row
+    return (
+      <Box
+        css={{
+          display: "grid",
+          "grid-template-columns": `repeat(${cols()}, 1fr)`,
+          gap: "10px",
+          paddingBottom: "$3",
+        }}
+      >
+        <For each={row.items}>
+          {(item) => {
+            const idx = () => getIndex(item)
+            const focused = () => focusIndex() === idx()
+            const link = () => getItemLink(item)
+            const thumbUrl = () => {
+              if (item.type === "gif") return link()
+              if (item.type === "image") return item.thumb || link()
+              if (item.type === "video") return item.thumb
+              return ""
+            }
+            return (
+              <Box
+                data-media-card={idx().toString()}
+                rounded="$xl"
+                overflow="hidden"
+                cursor="pointer"
+                border="1px solid"
+                borderColor={focused() ? "$primary7" : "$neutral6"}
+                bg="$neutral1"
+                transition="transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease"
+                boxShadow={
+                  focused()
+                    ? "0 0 0 3px $colors$primary4, 0 8px 22px $colors$neutral6"
+                    : "none"
+                }
+                _hover={{
+                  transform: "translateY(-3px)",
+                  boxShadow: "0 12px 26px $colors$neutral6",
+                  borderColor: "$primary6",
+                }}
+                onClick={() => openLightbox(idx())}
+              >
+                <Box
+                  bg="$neutral4"
+                  pos="relative"
+                  overflow="hidden"
+                  css={{ aspectRatio: "4 / 3" }}
+                >
+                  <Show
+                    when={thumbUrl()}
+                    fallback={
+                      <Center h="$full">
+                        <TypeIcon type={item.type} />
+                      </Center>
+                    }
+                  >
+                    <Image
+                      src={thumbUrl()}
+                      alt={item.name}
+                      w="$full"
+                      h="$full"
+                      objectFit="cover"
+                      loading="lazy"
+                      fallback={
+                        <Center h="$full">
+                          <Spinner size="sm" />
+                        </Center>
+                      }
+                    />
+                    <Show when={item.type === "video"}>
+                      <Box
+                        pos="absolute"
+                        top="0"
+                        right="0"
+                        bottom="0"
+                        left="0"
+                        display="flex"
+                        alignItems="center"
+                        justifyContent="center"
+                        pointerEvents="none"
+                      >
+                        <Box
+                          css={{
+                            width: 0,
+                            height: 0,
+                            borderTop: "13px solid transparent",
+                            borderBottom: "13px solid transparent",
+                            borderLeft: "20px solid rgba(255,255,255,0.9)",
+                            filter: "drop-shadow(0 1px 3px rgba(0,0,0,0.5))",
+                          }}
+                        />
+                      </Box>
+                    </Show>
+                  </Show>
+                  <Box pos="absolute" top="$1" right="$1">
+                    <Badge
+                      colorScheme={
+                        item.type === "image"
+                          ? "success"
+                          : item.type === "video"
+                            ? "danger"
+                            : "warning"
+                      }
+                      variant="solid"
+                      rounded="$md"
+                      fontSize="xs"
+                      textTransform="uppercase"
+                    >
+                      {item.type}
+                    </Badge>
+                  </Box>
+                </Box>
+                <Box p="$2">
+                  <Text
+                    size="xs"
+                    fontWeight="$semibold"
+                    color="$neutral12"
+                    css={{
+                      display: "-webkit-box",
+                      "-webkit-line-clamp": "2",
+                      "-webkit-box-orient": "vertical",
+                      overflow: "hidden",
+                      wordBreak: "break-all",
+                      lineHeight: "1.35",
+                    }}
+                  >
+                    {item.name}
+                  </Text>
+                  <Text size="xs" color="$neutral11" mt="2px">
+                    {formatSize(item.size)}
+                  </Text>
+                </Box>
+              </Box>
+            )
+          }}
+        </For>
+      </Box>
     )
   }
 
@@ -684,7 +1191,7 @@ const MediaView = () => {
             icon={<BsArrowLeft />}
             variant="ghost"
             size="sm"
-            onClick={() => to(encodePath(folderPath, true))}
+            onClick={() => to(encodePath(folderPath(), true))}
           />
           <Box flex={1} overflow="hidden">
             <Text
@@ -707,7 +1214,7 @@ const MediaView = () => {
                 textOverflow: "ellipsis",
               }}
             >
-              {folderPath}
+              {folderPath()}
             </Text>
           </Box>
           <Show when={scanning()}>
@@ -753,44 +1260,84 @@ const MediaView = () => {
             />
           </InputGroup>
           {!isMobile && <Box flex={1} />}
-          <Tooltip
-            label={`Recursive: ${recursive() ? "ON" : "OFF"} (depth ${maxDepth()}) — double-click to change depth`}
-            placement="bottom"
-          >
-            <Box
-              display="flex"
-              alignItems="center"
-              gap="$1"
-              px="$2"
-              py="$1"
-              rounded="$md"
-              cursor="pointer"
-              fontSize="xs"
-              border="1px solid"
-              borderColor={recursive() ? "$success7" : "$neutral6"}
-              bg={recursive() ? "$success3" : "transparent"}
-              color={recursive() ? "$success11" : "$neutral11"}
-              userSelect="none"
-              onClick={() => setRecursive((v) => !v)}
-              onDblClick={() => setMaxDepth((d) => (d >= 5 ? 1 : d + 1))}
-            >
-              <Box
-                as={recursive() ? FiChevronDown : FiChevronRight}
-                boxSize="12px"
-              />
-              Recursive
-              <Show when={recursive()}>
-                <Text size="xs" color="$neutral11">
-                  D{maxDepth()}
-                </Text>
-              </Show>
-            </Box>
-          </Tooltip>
           <Text size="xs" color="$neutral11" flexShrink={0}>
-            {flatItems().length} items · {folderGroups().length} folders
-            <Show when={hasMore()}> · showing {visibleGroups().length}</Show>
+            {flatItems().length} items
+            <Show when={subDirs().length > 0}>
+              {" · "}
+              {subDirs().length} folders
+            </Show>
           </Text>
         </Box>
+        <Show when={subDirs().length > 0}>
+          <Box px="$3" pb="$2" flexShrink={0}>
+            <Popover placement="bottom-start">
+              {({ onClose }) => (
+                <>
+                  <PopoverTrigger as={Button} variant="outline" size="sm">
+                    <Box as={AiOutlineFolder} boxSize="14px" flexShrink={0} />
+                    Folders
+                    <Badge colorScheme="neutral" variant="subtle" ml="$1">
+                      {subDirs().length}
+                    </Badge>
+                  </PopoverTrigger>
+                  <PopoverContent w="280px">
+                    <PopoverBody p="$1" display="flex" flexDirection="column">
+                      <Input
+                        placeholder="Filter folders…"
+                        value={dirFilter()}
+                        onInput={(e) => setDirFilter(e.currentTarget.value)}
+                        size="sm"
+                        mb="$1"
+                      />
+                      <Box maxH="50vh" overflowY="auto">
+                        <For each={filteredSubDirs()}>
+                          {(sub) => {
+                            const name = sub.split("/").pop() || sub
+                            return (
+                              <Box
+                                display="flex"
+                                alignItems="center"
+                                gap="$2"
+                                px="$2"
+                                py="$1_5"
+                                rounded="$md"
+                                cursor="pointer"
+                                _hover={{ bg: "$neutral3" }}
+                                onClick={() => {
+                                  onClose()
+                                  setDirFilter("")
+                                  scrollToFolder(sub)
+                                }}
+                              >
+                                <Box
+                                  as={AiOutlineFolder}
+                                  boxSize="14px"
+                                  color="$primary9"
+                                  flexShrink={0}
+                                />
+                                <Text
+                                  size="sm"
+                                  css={{ wordBreak: "break-all" }}
+                                >
+                                  {name}
+                                </Text>
+                              </Box>
+                            )
+                          }}
+                        </For>
+                        <Show when={filteredSubDirs().length === 0}>
+                          <Text size="xs" color="$neutral10" px="$2" py="$2">
+                            No folders match
+                          </Text>
+                        </Show>
+                      </Box>
+                    </PopoverBody>
+                  </PopoverContent>
+                </>
+              )}
+            </Popover>
+          </Box>
+        </Show>
       </Box>
 
       {/* ═══════ Scanning Progress ═══════ */}
@@ -803,13 +1350,14 @@ const MediaView = () => {
       </Show>
 
       {/* ═══════ Main Content ═══════ */}
+      <style>{`.mv-grid, .mv-grid * { box-sizing: border-box; }`}</style>
       <Box
         ref={scrollRef}
+        class="mv-grid"
         flex={1}
         overflowY="auto"
         overflowX="hidden"
         px="$3"
-        py="$2"
       >
         <Show
           when={!loading()}
@@ -827,7 +1375,7 @@ const MediaView = () => {
           }
         >
           <Show
-            when={visibleGroups().length > 0}
+            when={rows().length > 0}
             fallback={
               <Center h="$full">
                 <Box textAlign="center">
@@ -847,323 +1395,34 @@ const MediaView = () => {
               </Center>
             }
           >
-            <For each={visibleGroups()}>
-              {(group) => (
-                <Box mb="$5">
-                  {/* ── Folder Header ── */}
-                  <Box
-                    display="flex"
-                    alignItems="center"
-                    gap="$2"
-                    mb="$2"
-                    pb="$1"
-                    borderBottom="1px solid $neutral5"
-                  >
-                    <Box
-                      as={AiOutlineFolder}
-                      boxSize="$4"
-                      color="$primary9"
-                      flexShrink={0}
-                    />
-                    <Text
-                      size="sm"
-                      fontWeight="$bold"
-                      color="$neutral12"
-                      flex={1}
-                      css={{
-                        whiteSpace: "nowrap",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                      }}
-                    >
-                      {group.displayName}
-                    </Text>
-                    <Badge
-                      colorScheme="neutral"
-                      variant="subtle"
-                      rounded="$full"
-                      fontSize="xs"
-                    >
-                      {group.items.length}
-                    </Badge>
-                  </Box>
-
-                  {/* ── Text files: full-width content blocks ── */}
-                  <For each={group.items.filter((i) => i.type === "text")}>
-                    {(item) => {
-                      const idx = () => getIndex(item)
-                      const focused = () => focusIndex() === idx()
-                      const textKey = `${item.path}/${item.name}`
-                      const content = () => textCache()[textKey]
-
-                      // Register for lazy text fetch via observer
-                      let cardEl: HTMLDivElement | undefined
-                      onMount(() => {
-                        if (cardEl && textObserver) {
-                          cardEl.setAttribute("data-text-key", textKey)
-                          textObserver.observe(cardEl)
-                        }
-                      })
-
-                      return (
-                        <Box
-                          ref={cardEl}
-                          data-media-card={idx().toString()}
-                          rounded="$xl"
-                          overflow="hidden"
-                          cursor="pointer"
-                          border="1px solid"
-                          borderColor={focused() ? "$primary7" : "$neutral6"}
-                          bg="$neutral1"
-                          mb="$3"
-                          transition="transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease"
-                          boxShadow={
-                            focused()
-                              ? "0 0 0 3px $colors$primary4, 0 8px 22px $colors$neutral6"
-                              : "0 1px 3px $colors$neutral7"
-                          }
-                          _hover={{
-                            transform: "translateY(-2px)",
-                            boxShadow: "0 10px 24px $colors$neutral6",
-                            borderColor: "$primary6",
-                          }}
-                          onClick={() => openLightbox(idx())}
-                          onMouseEnter={() => setFocusIndex(idx())}
-                        >
-                          {/* File name header */}
-                          <Box
-                            display="flex"
-                            alignItems="center"
-                            gap="$2"
-                            px="$4"
-                            py="$2_5"
-                            borderBottom="1px solid $neutral5"
-                            bg="$neutral3"
-                          >
-                            <Box
-                              as={FiType}
-                              boxSize="16px"
-                              color="$info9"
-                              flexShrink={0}
-                            />
-                            <Text
-                              size="sm"
-                              fontWeight="$bold"
-                              color="$neutral12"
-                              flex={1}
-                              css={{
-                                wordBreak: "break-all",
-                                lineHeight: "1.35",
-                              }}
-                            >
-                              {item.name}
-                            </Text>
-                            <Text size="xs" color="$neutral10">
-                              {formatSize(item.size)}
-                            </Text>
-                          </Box>
-
-                          {/* Text content — markdown-body style, fully displayed */}
-                          <Box px="$4" py="$3" css={{ userSelect: "text" }}>
-                            <Show
-                              when={content() !== undefined}
-                              fallback={
-                                <Box
-                                  display="flex"
-                                  alignItems="center"
-                                  gap="$2"
-                                  py="$2"
-                                >
-                                  <Spinner size="sm" />
-                                  <Text size="xs" color="$neutral10">
-                                    Loading…
-                                  </Text>
-                                </Box>
-                              }
-                            >
-                              <Show
-                                when={content()}
-                                fallback={
-                                  <Text
-                                    size="sm"
-                                    color="$neutral9"
-                                    fontStyle="italic"
-                                  >
-                                    (empty file)
-                                  </Text>
-                                }
-                              >
-                                <Box
-                                  class="markdown-body word-wrap"
-                                  as="pre"
-                                  m={0}
-                                  css={{
-                                    whiteSpace: "pre-wrap",
-                                    wordBreak: "break-word",
-                                    fontSize: "16px",
-                                    lineHeight: "1.6",
-                                    fontFamily:
-                                      "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif",
-                                  }}
-                                >
-                                  {content()}
-                                </Box>
-                              </Show>
-                            </Show>
-                          </Box>
-                        </Box>
-                      )
+            <div
+              style={{
+                height: `${virtualizer.getTotalSize()}px`,
+                position: "relative",
+                width: "100%",
+              }}
+            >
+              <For each={virtualizer.getVirtualItems()}>
+                {(vi) => (
+                  <div
+                    ref={(el) => {
+                      if (el && rowResizeObserver) rowResizeObserver.observe(el)
+                      return () => rowResizeObserver?.unobserve(el)
                     }}
-                  </For>
-
-                  {/* ── Media Grid (images, videos, gifs) ── */}
-                  <Show when={group.items.some((i) => i.type !== "text")}>
-                    <Box
-                      css={{
-                        display: "grid",
-                        "grid-template-columns": isMobile
-                          ? "repeat(auto-fill, minmax(150px, 1fr))"
-                          : "repeat(auto-fill, minmax(180px, 1fr))",
-                        gap: "10px",
-                      }}
-                    >
-                      <For each={group.items.filter((i) => i.type !== "text")}>
-                        {(item) => {
-                          const idx = () => getIndex(item)
-                          const focused = () => focusIndex() === idx()
-                          const link = () => getItemLink(item)
-                          const thumbUrl = () => {
-                            if (item.type === "gif") return link()
-                            if (item.type === "image")
-                              return item.thumb || link()
-                            return ""
-                          }
-
-                          return (
-                            <Box
-                              data-media-card={idx().toString()}
-                              rounded="$xl"
-                              overflow="hidden"
-                              cursor="pointer"
-                              border="1px solid"
-                              borderColor={
-                                focused() ? "$primary7" : "$neutral6"
-                              }
-                              bg="$neutral1"
-                              transition="transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease"
-                              boxShadow={
-                                focused()
-                                  ? "0 0 0 3px $colors$primary4, 0 8px 22px $colors$neutral6"
-                                  : "0 1px 3px $colors$neutral7"
-                              }
-                              _hover={{
-                                transform: "translateY(-3px)",
-                                boxShadow: "0 12px 26px $colors$neutral6",
-                                borderColor: "$primary6",
-                              }}
-                              onClick={() => openLightbox(idx())}
-                              onMouseEnter={() => setFocusIndex(idx())}
-                            >
-                              <Box
-                                bg="$neutral4"
-                                pos="relative"
-                                overflow="hidden"
-                                css={{ aspectRatio: "4 / 3" }}
-                              >
-                                <Show
-                                  when={
-                                    (item.type === "image" ||
-                                      item.type === "gif") &&
-                                    thumbUrl()
-                                  }
-                                  fallback={
-                                    <Show
-                                      when={item.type === "video"}
-                                      fallback={
-                                        <Center h="$full">
-                                          <TypeIcon type={item.type} />
-                                        </Center>
-                                      }
-                                    >
-                                      <Box
-                                        as="video"
-                                        w="$full"
-                                        h="$full"
-                                        objectFit="cover"
-                                        preload="metadata"
-                                        muted
-                                        src={link() + "#t=0.5"}
-                                      />
-                                    </Show>
-                                  }
-                                >
-                                  <Image
-                                    src={thumbUrl()}
-                                    alt={item.name}
-                                    w="$full"
-                                    h="$full"
-                                    objectFit="cover"
-                                    fallback={
-                                      <Center h="$full">
-                                        <Spinner size="sm" />
-                                      </Center>
-                                    }
-                                  />
-                                </Show>
-                                <Box pos="absolute" top="$1" right="$1">
-                                  <Badge
-                                    colorScheme={
-                                      item.type === "image"
-                                        ? "success"
-                                        : item.type === "video"
-                                          ? "danger"
-                                          : "warning"
-                                    }
-                                    variant="solid"
-                                    rounded="$md"
-                                    fontSize="xs"
-                                    textTransform="uppercase"
-                                  >
-                                    {item.type}
-                                  </Badge>
-                                </Box>
-                              </Box>
-                              <Box p="$2">
-                                <Text
-                                  size="xs"
-                                  fontWeight="$semibold"
-                                  color="$neutral12"
-                                  css={{
-                                    wordBreak: "break-all",
-                                    lineHeight: "1.35",
-                                  }}
-                                >
-                                  {item.name}
-                                </Text>
-                                <Text size="xs" color="$neutral11" mt="2px">
-                                  {formatSize(item.size)}
-                                </Text>
-                              </Box>
-                            </Box>
-                          )
-                        }}
-                      </For>
-                    </Box>
-                  </Show>
-                </Box>
-              )}
-            </For>
-
-            {/* ── Lazy load sentinel ── */}
-            <Show when={hasMore()}>
-              <Box ref={observeSentinel} py="$4" textAlign="center">
-                <Spinner size="sm" />
-                <Text size="xs" color="$neutral11" mt="$1">
-                  Loading more… ({visibleGroups().length}/
-                  {folderGroups().length} folders)
-                </Text>
-              </Box>
-            </Show>
+                    data-index={vi.index}
+                    style={{
+                      position: "absolute",
+                      top: 0,
+                      left: 0,
+                      width: "100%",
+                      transform: `translateY(${vi.start}px)`,
+                    }}
+                  >
+                    {renderRow(rows()[vi.index])}
+                  </div>
+                )}
+              </For>
+            </div>
           </Show>
         </Show>
       </Box>
@@ -1174,6 +1433,80 @@ const MediaView = () => {
           const item = () => currentItem()
           const idx = () => lightboxIndex()!
           const len = () => flatItems().length
+          // Render a single media item (image / video / text). `exiting`
+          // mutes + pauses video so the outgoing copy doesn't double the audio.
+          const renderMediaItem = (it: MediaItem, exiting = false) => {
+            const link = getItemLink(it)
+            if (it.type === "image" || it.type === "gif") {
+              return (
+                <Image
+                  src={link}
+                  alt={it.name}
+                  maxW="92%"
+                  maxH="90vh"
+                  objectFit="contain"
+                  rounded="$lg"
+                  onClick={(e: MouseEvent) => e.stopPropagation()}
+                />
+              )
+            }
+            if (it.type === "video") {
+              return (
+                <Box
+                  as="video"
+                  src={link}
+                  controls={!exiting}
+                  autoplay={!exiting}
+                  muted={exiting}
+                  maxW="92%"
+                  maxH="90vh"
+                  rounded="$lg"
+                  onClick={(e: MouseEvent) => e.stopPropagation()}
+                  css={{ outline: "none", touchAction: "pan-y" }}
+                />
+              )
+            }
+            if (it.type === "text") {
+              const key = `${it.path}/${it.name}`
+              const content = textCache()[key]
+              return (
+                <Box
+                  w="min(800px, 90%)"
+                  maxH="85vh"
+                  overflowY="auto"
+                  bg="$neutral2"
+                  rounded="$lg"
+                  p="$4"
+                  onClick={(e: MouseEvent) => e.stopPropagation()}
+                >
+                  <Show
+                    when={content !== undefined}
+                    fallback={
+                      <Center py="$8">
+                        <Spinner />
+                      </Center>
+                    }
+                  >
+                    <Box
+                      as="pre"
+                      fontFamily="$mono"
+                      fontSize="14px"
+                      lineHeight="1.7"
+                      color="$neutral12"
+                      m={0}
+                      css={{
+                        whiteSpace: "pre-wrap",
+                        wordBreak: "break-word",
+                      }}
+                    >
+                      {content}
+                    </Box>
+                  </Show>
+                </Box>
+              )
+            }
+            return null
+          }
           return (
             <Box
               pos="fixed"
@@ -1182,75 +1515,249 @@ const MediaView = () => {
               bottom="0"
               left="0"
               zIndex={1100}
-              display="flex"
-              flexDirection="column"
+              css={{ touchAction: "pan-y", overflow: "hidden" }}
             >
+              <style>{`
+                @keyframes mvInNext  { from { transform: translateX(100%); }  to { transform: translateX(0); } }
+                @keyframes mvInPrev  { from { transform: translateX(-100%); } to { transform: translateX(0); } }
+                @keyframes mvOutNext { from { transform: translateX(0); }    to { transform: translateX(-100%); } }
+                @keyframes mvOutPrev { from { transform: translateX(0); }    to { transform: translateX(100%); } }
+                @keyframes mvInOpen  { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+                .mv-in-next  { animation: mvInNext  0.32s cubic-bezier(0.22,0.61,0.36,1); }
+                .mv-in-prev  { animation: mvInPrev  0.32s cubic-bezier(0.22,0.61,0.36,1); }
+                .mv-out-next { animation: mvOutNext 0.32s cubic-bezier(0.22,0.61,0.36,1) forwards; }
+                .mv-out-prev { animation: mvOutPrev 0.32s cubic-bezier(0.22,0.61,0.36,1) forwards; }
+                .mv-in-open  { animation: mvInOpen  0.2s ease-out; }
+                html, body { overscroll-behavior-x: none !important; }
+              `}</style>
+              {/* backdrop */}
               <Box
                 pos="absolute"
                 top="0"
                 right="0"
                 bottom="0"
                 left="0"
-                css={{ background: "rgba(0,0,0,0.92)" }}
-                onClick={closeLightbox}
+                css={{ background: "#000" }}
               />
+              {/* media stage — full screen; swipe to browse, tap to close */}
               <Box
-                pos="relative"
-                display="flex"
-                alignItems="center"
-                gap="$2"
-                px="$3"
-                py="$2"
+                pos="absolute"
+                top="0"
+                right="0"
+                bottom="0"
+                left="0"
                 zIndex={1}
+                css={{
+                  // pan-y: let text scroll vertically; hand horizontal swipes
+                  // (browse) to JS and stop the browser's swipe-to-go-back from
+                  // hijacking them.
+                  overscrollBehavior: "none",
+                  touchAction: "pan-y",
+                  overflow: "hidden",
+                }}
+                onTouchStart={(e: TouchEvent) => {
+                  touchStartX = e.touches[0].clientX
+                  touchStartY = e.touches[0].clientY
+                  touchMoved = false
+                  touchStartTarget = e.target as HTMLElement | null
+                }}
+                onTouchMove={(e: TouchEvent) => {
+                  const dx = e.touches[0].clientX - touchStartX
+                  const dy = e.touches[0].clientY - touchStartY
+                  if (Math.abs(dx) > 10 || Math.abs(dy) > 10) touchMoved = true
+                }}
+                onTouchEnd={(e: TouchEvent) => {
+                  const dx = e.changedTouches[0].clientX - touchStartX
+                  const dy = e.changedTouches[0].clientY - touchStartY
+                  if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) {
+                    // horizontal swipe → browse (left=prev, right=next). On video,
+                    // ignore swipes that start on the bottom control bar so the
+                    // native seek bar can be dragged instead.
+                    if (item()?.type === "video" && startedOnVideoControls())
+                      return
+                    if (dx > 0) lightboxPrev()
+                    else lightboxNext()
+                  } else if (
+                    Math.abs(dy) > 50 &&
+                    Math.abs(dy) > Math.abs(dx) &&
+                    item()?.type !== "text"
+                  ) {
+                    // vertical swipe → exit (swipe up/down to close); text is
+                    // skipped so it can scroll
+                    closeLightbox()
+                  }
+                }}
+                onClick={() => {
+                  // tap empty area to close; a swipe sets touchMoved so it
+                  // won't also close
+                  if (!touchMoved) closeLightbox()
+                }}
               >
-                <Text
-                  size="sm"
-                  color="white"
-                  fontWeight="$medium"
-                  flex={1}
-                  css={{
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                  }}
-                >
-                  {item()?.name}
-                </Text>
-                <Text size="xs" css={{ color: "rgba(255,255,255,0.5)" }}>
-                  {idx() + 1} / {len()}
-                </Text>
-                <Show when={item()}>
-                  <Badge
-                    colorScheme="neutral"
-                    variant="subtle"
-                    rounded="$md"
-                    fontSize="xs"
-                  >
-                    {formatSize(item()!.size)}
-                  </Badge>
+                <Show when={outgoing()} keyed>
+                  {(out) => (
+                    <Box
+                      class={out.dir === "prev" ? "mv-out-prev" : "mv-out-next"}
+                      pos="absolute"
+                      top="0"
+                      right="0"
+                      bottom="0"
+                      left="0"
+                      display="flex"
+                      alignItems="center"
+                      justifyContent="center"
+                      zIndex={1}
+                      css={{ pointerEvents: "none" }}
+                    >
+                      {renderMediaItem(out.item, true)}
+                    </Box>
+                  )}
                 </Show>
-                <IconButton
-                  aria-label="Close"
-                  icon={<BsX />}
-                  variant="ghost"
-                  color="white"
-                  size="sm"
-                  onClick={closeLightbox}
-                  css={{
-                    "&:hover": { backgroundColor: "rgba(255,255,255,0.1)" },
-                  }}
-                />
+                <For each={[idx()]}>
+                  {() => (
+                    <Box
+                      class={
+                        navDir() === "prev"
+                          ? "mv-in-prev"
+                          : navDir() === "next"
+                            ? "mv-in-next"
+                            : "mv-in-open"
+                      }
+                      pos="absolute"
+                      top="0"
+                      right="0"
+                      bottom="0"
+                      left="0"
+                      display="flex"
+                      alignItems="center"
+                      justifyContent="center"
+                      zIndex={2}
+                    >
+                      <Show when={item()}>{renderMediaItem(item()!)}</Show>
+                    </Box>
+                  )}
+                </For>
               </Box>
+              {/* top overlay — filename + close (gradient, click-through) */}
               <Box
-                pos="relative"
-                flex={1}
-                display="flex"
-                alignItems="center"
-                justifyContent="center"
-                zIndex={1}
-                overflow="auto"
-                p="$4"
+                pos="absolute"
+                top="0"
+                left="0"
+                right="0"
+                zIndex={5}
+                css={{
+                  pointerEvents: "none",
+                  background:
+                    "linear-gradient(to bottom, rgba(0,0,0,0.6), transparent)",
+                }}
               >
+                <Box
+                  display="flex"
+                  alignItems="center"
+                  gap="$2"
+                  px="$3"
+                  py="$2_5"
+                >
+                  <Text
+                    flex={1}
+                    size="sm"
+                    color="white"
+                    fontWeight="$semibold"
+                    css={{
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      textShadow: "0 1px 4px rgba(0,0,0,0.6)",
+                    }}
+                  >
+                    {item()?.name}
+                  </Text>
+                  <IconButton
+                    aria-label="Close"
+                    icon={<BsX />}
+                    variant="ghost"
+                    color="white"
+                    size="lg"
+                    rounded="$full"
+                    onClick={closeLightbox}
+                    css={{
+                      pointerEvents: "auto",
+                      background: "rgba(255,255,255,0.14)",
+                      "&:hover": { background: "rgba(255,255,255,0.26)" },
+                    }}
+                  />
+                </Box>
+              </Box>
+              {/* bottom overlay — counter + hints (gradient, click-through) */}
+              <Box
+                pos="absolute"
+                bottom="0"
+                left="0"
+                right="0"
+                zIndex={5}
+                css={{
+                  pointerEvents: "none",
+                  background:
+                    "linear-gradient(to top, rgba(0,0,0,0.6), transparent)",
+                }}
+              >
+                <Box
+                  display="flex"
+                  alignItems="center"
+                  gap="$3"
+                  px="$3"
+                  py="$2_5"
+                >
+                  <Text
+                    size="xs"
+                    css={{
+                      color: "rgba(255,255,255,0.75)",
+                      textShadow: "0 1px 4px rgba(0,0,0,0.6)",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {idx() + 1} / {len()}
+                    <Show when={item()}>
+                      {" · "}
+                      {formatSize(item()!.size)}
+                    </Show>
+                  </Text>
+                  <Show when={!isMobile}>
+                    <Box
+                      flex={1}
+                      display="flex"
+                      justifyContent="flex-end"
+                      gap="$3"
+                    >
+                      <Text size="xs" css={{ color: "rgba(255,255,255,0.5)" }}>
+                        <Kbd
+                          css={{
+                            background: "rgba(255,255,255,0.1)",
+                            borderColor: "rgba(255,255,255,0.2)",
+                            color: "rgba(255,255,255,0.7)",
+                          }}
+                        >
+                          ← →
+                        </Kbd>{" "}
+                        prev/next
+                      </Text>
+                      <Text size="xs" css={{ color: "rgba(255,255,255,0.5)" }}>
+                        <Kbd
+                          css={{
+                            background: "rgba(255,255,255,0.1)",
+                            borderColor: "rgba(255,255,255,0.2)",
+                            color: "rgba(255,255,255,0.7)",
+                          }}
+                        >
+                          ↑↓ / Esc
+                        </Kbd>{" "}
+                        close
+                      </Text>
+                    </Box>
+                  </Show>
+                </Box>
+              </Box>
+              {/* desktop nav arrows — left/right to browse (no touch on desktop) */}
+              <Show when={!isMobile}>
                 <Show when={idx() > 0}>
                   <IconButton
                     aria-label="Previous"
@@ -1259,94 +1766,20 @@ const MediaView = () => {
                     color="white"
                     size="lg"
                     pos="absolute"
-                    left="$2"
+                    left="$3"
                     top="50%"
                     transform="translateY(-50%)"
-                    zIndex={2}
+                    zIndex={6}
                     onClick={(e: MouseEvent) => {
                       e.stopPropagation()
                       lightboxPrev()
                     }}
                     css={{
-                      background: "rgba(255,255,255,0.1)",
-                      "&:hover": { background: "rgba(255,255,255,0.2)" },
+                      background: "rgba(255,255,255,0.14)",
+                      "&:hover": { background: "rgba(255,255,255,0.26)" },
                     }}
                     rounded="$full"
                   />
-                </Show>
-                <Show when={item()}>
-                  {(() => {
-                    const it = item()!
-                    const link = getItemLink(it)
-                    if (it.type === "image" || it.type === "gif") {
-                      return (
-                        <Image
-                          src={link}
-                          alt={it.name}
-                          maxW="90%"
-                          maxH="85vh"
-                          objectFit="contain"
-                          rounded="$lg"
-                          onClick={(e: MouseEvent) => e.stopPropagation()}
-                        />
-                      )
-                    }
-                    if (it.type === "video") {
-                      return (
-                        <Box
-                          as="video"
-                          src={link}
-                          controls
-                          autoplay
-                          maxW="90%"
-                          maxH="85vh"
-                          rounded="$lg"
-                          onClick={(e: MouseEvent) => e.stopPropagation()}
-                          css={{ outline: "none" }}
-                        />
-                      )
-                    }
-                    if (it.type === "text") {
-                      const key = `${it.path}/${it.name}`
-                      const content = textCache()[key]
-                      return (
-                        <Box
-                          w="min(800px, 90%)"
-                          maxH="80vh"
-                          overflowY="auto"
-                          bg="$neutral2"
-                          rounded="$lg"
-                          p="$4"
-                          onClick={(e: MouseEvent) => e.stopPropagation()}
-                        >
-                          <Show
-                            when={content !== undefined}
-                            fallback={
-                              <Center py="$8">
-                                <Spinner />
-                              </Center>
-                            }
-                          >
-                            <Box
-                              as="pre"
-                              fontFamily="$mono"
-                              fontSize="14px"
-                              lineHeight="1.7"
-                              color="$neutral12"
-                              m={0}
-                              css={{
-                                whiteSpace: "pre-wrap",
-                                wordBreak: "break-word",
-                              }}
-                            >
-                              {content}
-                            </Box>
-                          </Show>
-                        </Box>
-                      )
-                    }
-                    return null
-                  })()}
                 </Show>
                 <Show when={idx() < len() - 1}>
                   <IconButton
@@ -1356,57 +1789,21 @@ const MediaView = () => {
                     color="white"
                     size="lg"
                     pos="absolute"
-                    right="$2"
+                    right="$3"
                     top="50%"
                     transform="translateY(-50%)"
-                    zIndex={2}
+                    zIndex={6}
                     onClick={(e: MouseEvent) => {
                       e.stopPropagation()
                       lightboxNext()
                     }}
                     css={{
-                      background: "rgba(255,255,255,0.1)",
-                      "&:hover": { background: "rgba(255,255,255,0.2)" },
+                      background: "rgba(255,255,255,0.14)",
+                      "&:hover": { background: "rgba(255,255,255,0.26)" },
                     }}
                     rounded="$full"
                   />
                 </Show>
-              </Box>
-              <Show when={!isMobile}>
-                <Box
-                  pos="relative"
-                  display="flex"
-                  justifyContent="center"
-                  gap="$4"
-                  px="$3"
-                  py="$2"
-                  zIndex={1}
-                >
-                  <Text size="xs" css={{ color: "rgba(255,255,255,0.4)" }}>
-                    <Kbd
-                      css={{
-                        background: "rgba(255,255,255,0.1)",
-                        borderColor: "rgba(255,255,255,0.2)",
-                        color: "rgba(255,255,255,0.6)",
-                      }}
-                    >
-                      ← →
-                    </Kbd>{" "}
-                    prev/next
-                  </Text>
-                  <Text size="xs" css={{ color: "rgba(255,255,255,0.4)" }}>
-                    <Kbd
-                      css={{
-                        background: "rgba(255,255,255,0.1)",
-                        borderColor: "rgba(255,255,255,0.2)",
-                        color: "rgba(255,255,255,0.6)",
-                      }}
-                    >
-                      Esc
-                    </Kbd>{" "}
-                    close
-                  </Text>
-                </Box>
               </Show>
             </Box>
           )
@@ -1539,7 +1936,7 @@ const MediaView = () => {
                   title: "Preview",
                   items: [
                     ["← → / h l", "Previous / next"],
-                    ["Esc", "Close preview"],
+                    ["↑↓ / Esc", "Close preview"],
                   ],
                 },
               ]}
