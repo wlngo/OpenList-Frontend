@@ -14,7 +14,6 @@ import {
   InputGroup,
   InputLeftElement,
   IconButton,
-  Badge,
   Button,
   Center,
   Image,
@@ -25,7 +24,6 @@ import {
   Spinner,
   Tooltip,
   Kbd,
-  useColorModeValue,
 } from "@hope-ui/solid"
 import {
   BsArrowLeft,
@@ -52,7 +50,6 @@ import {
   notify,
   encodePath,
 } from "~/utils"
-import { isMobile } from "~/utils/compatibility"
 import { getLinkByDirAndObj } from "~/hooks/useLink"
 import { createVirtualizer } from "@tanstack/solid-virtual"
 import "~/components/markdown.css"
@@ -148,6 +145,40 @@ const TEXT_EXTS = new Set([
 const MIN_CARD_W = 180
 const CARD_GAP = 10
 
+/* responsive breakpoints — everything is driven by the live container width
+   (ResizeObserver), never by a one-shot UA check, so tablets, rotation,
+   split-screen and window resize all behave correctly */
+const PHONE_W = 640 // below: phone layout (full-width search, swipe-only lightbox)
+// fine pointer (mouse/trackpad) → keyboard hints make sense
+const FINE_POINTER =
+  typeof matchMedia !== "undefined" && matchMedia("(pointer: fine)").matches
+
+/* minimum card width tiers: phone / tablet / desktop */
+const minCardW = (w: number) => (w < 480 ? 130 : w < 900 ? 160 : MIN_CARD_W)
+
+/* macOS frosted-white palette (Photos-inspired). The media view is a fixed
+   light overlay by design, so these are hardcoded instead of theme tokens. */
+const MV = {
+  bg: "#F5F5F7",
+  surface: "#FFFFFF",
+  glass: "rgba(255,255,255,0.72)",
+  hairline: "rgba(0,0,0,0.08)",
+  label: "rgba(60,60,67,0.92)",
+  label2: "rgba(60,60,67,0.58)",
+  label3: "rgba(60,60,67,0.34)",
+  accent: "#007AFF",
+  dot: {
+    image: "#34C759",
+    video: "#FF3B30",
+    gif: "#FF9500",
+    text: "#5E5CE6",
+  } as Record<MediaItem["type"], string>,
+  glassBlur: "blur(20px) saturate(180%)",
+  shadowCard: "0 1px 2px rgba(0,0,0,0.04), 0 4px 14px rgba(0,0,0,0.05)",
+  shadowCardHover: "0 2px 6px rgba(0,0,0,0.05), 0 12px 30px rgba(0,0,0,0.10)",
+  shadowPop: "0 2px 8px rgba(0,0,0,0.06), 0 16px 48px rgba(0,0,0,0.16)",
+}
+
 const getMediaType = (name: string): MediaItem["type"] | null => {
   const e = ext(name).toLowerCase()
   if (IMAGE_EXTS.has(e)) return "image"
@@ -170,15 +201,6 @@ const formatSize = (bytes: number): string => {
 
 const MediaView = () => {
   const { pathname, isShare, to } = useRouter()
-
-  const glassBg = useColorModeValue(
-    "rgba(255,255,255,0.72)",
-    "rgba(20,22,26,0.72)",
-  )
-  const glassBorder = useColorModeValue(
-    "rgba(0,0,0,0.06)",
-    "rgba(255,255,255,0.08)",
-  )
 
   const folderPath = createMemo(() => {
     const rawPath = pathname()
@@ -215,7 +237,9 @@ const MediaView = () => {
   const [showJump, setShowJump] = createSignal(false)
   const [jumpInput, setJumpInput] = createSignal("")
   const [textCache, setTextCache] = createSignal<Record<string, string>>({})
-  const [cols, setCols] = createSignal(isMobile ? 2 : 4)
+  const [cols, setCols] = createSignal(
+    typeof window !== "undefined" && window.innerWidth < PHONE_W ? 2 : 4,
+  )
   const [containerWidth, setContainerWidth] = createSignal(0)
   // actual measured row heights (via our own ResizeObserver) — index → px.
   // Lets variable-height rows (full text) be positioned correctly without
@@ -401,13 +425,16 @@ const MediaView = () => {
   /* Our own ResizeObserver measures each rendered row's real height (including
      full, variable-height text) and feeds it back via estimateSize. Unlike the
      built-in measureElement it isn't skipped during scroll, so rows mounted
-     while scrolling get measured too (no overlap). */
+     while scrolling get measured too (no overlap).
+     Updates are coalesced through rAF: during fast scroll many ResizeObserver
+     batches fire, and each signal write + virtualizer.measure() is O(rows) —
+     flushing once per frame instead of per batch is what keeps large libraries
+     scrolling smoothly. */
+  const pendingRowHeights = new Map<number, number>()
+  let rowHeightFlushScheduled = false
   const rowResizeObserver =
     typeof ResizeObserver !== "undefined"
       ? new ResizeObserver((entries) => {
-          const updates: Record<number, number> = {}
-          let changed = false
-          const prev = measuredHeights()
           for (const entry of entries) {
             const el = entry.target as HTMLElement
             const idxStr = el.dataset.index
@@ -419,15 +446,28 @@ const MediaView = () => {
               continue
             }
             const h = el.getBoundingClientRect().height
-            if (h > 0 && prev[idx] !== h) {
-              updates[idx] = h
-              changed = true
+            if (h > 0) pendingRowHeights.set(idx, h)
+          }
+          if (pendingRowHeights.size === 0 || rowHeightFlushScheduled) return
+          rowHeightFlushScheduled = true
+          requestAnimationFrame(() => {
+            rowHeightFlushScheduled = false
+            const updates: Record<number, number> = {}
+            let changed = false
+            const prev = measuredHeights()
+            pendingRowHeights.forEach((h, idx) => {
+              // ignore sub-pixel jitter to avoid measure feedback loops
+              if (Math.abs((prev[idx] ?? -1) - h) >= 1) {
+                updates[idx] = h
+                changed = true
+              }
+            })
+            pendingRowHeights.clear()
+            if (changed) {
+              setMeasuredHeights((p) => ({ ...p, ...updates }))
+              virtualizer.measure()
             }
-          }
-          if (changed) {
-            setMeasuredHeights((p) => ({ ...p, ...updates }))
-            virtualizer.measure()
-          }
+          })
         })
       : undefined
 
@@ -436,7 +476,7 @@ const MediaView = () => {
     if (w > 0) {
       setContainerWidth(w)
       const gridW = Math.max(0, w - 24) // px=$3 padding
-      const minW = isMobile ? 150 : MIN_CARD_W
+      const minW = minCardW(w)
       setCols(Math.max(1, Math.floor((gridW + CARD_GAP) / (minW + CARD_GAP))))
     }
   }
@@ -633,6 +673,23 @@ const MediaView = () => {
     if (r >= 0) virtualizer.scrollToIndex(r, { align: "start" })
   }
 
+  /* warm the adjacent images so the first view of the next/prev page is
+     instant (fetched at low priority so it never competes with the current
+     one; videos are skipped — preloading those would waste bandwidth) */
+  const preloadAdjacent = (index: number) => {
+    const flat = flatItems()
+    for (const off of [-2, -1, 1, 2]) {
+      const it = flat[index + off]
+      if (!it || (it.type !== "image" && it.type !== "gif")) continue
+      // document.createElement instead of `new Image()` — the Hope UI Image
+      // import shadows the DOM constructor
+      const img = document.createElement("img")
+      img.decoding = "async"
+      img.setAttribute("fetchpriority", "low")
+      img.src = getItemLink(it)
+    }
+  }
+
   const openLightbox = (index: number) => {
     clearTimeout(outTimer)
     setOutgoing(null)
@@ -641,11 +698,17 @@ const MediaView = () => {
     setFocusIndex(index)
     const item = flatItems()[index]
     if (item?.type === "text") fetchTextContent(item)
+    preloadAdjacent(index)
   }
 
   const closeLightbox = () => {
     clearTimeout(outTimer)
     setOutgoing(null)
+    // sync the grid once on exit instead of on every flip — scrolling the
+    // hidden grid per page turn mounted rows and churned the virtualizer,
+    // which made flipping janky
+    const idx = lightboxIndex()
+    if (idx !== null) syncGridTo(idx)
     setLightboxIndex(null)
   }
 
@@ -656,14 +719,18 @@ const MediaView = () => {
       const ni = idx - 1
       // snapshot the item being left so it can slide out while the new one
       // slides in (dual-layer vertical page-turn, TikTok-style).
-      setOutgoing(cur ? { item: cur, dir: "prev" } : null)
+      // the outgoing snapshot only pays off for stills — a second mounted
+      // video doubles decode cost during the slide for no visual gain
+      setOutgoing(
+        cur && cur.type !== "video" ? { item: cur, dir: "prev" } : null,
+      )
       setNavDir("prev")
       setLightboxIndex(ni)
       clearTimeout(outTimer)
       outTimer = setTimeout(() => setOutgoing(null), 360)
       const item = flatItems()[ni]
       if (item?.type === "text") fetchTextContent(item)
-      syncGridTo(ni)
+      preloadAdjacent(ni)
     }
   }
 
@@ -673,14 +740,16 @@ const MediaView = () => {
     if (idx !== null && idx < len - 1) {
       const cur = flatItems()[idx]
       const ni = idx + 1
-      setOutgoing(cur ? { item: cur, dir: "next" } : null)
+      setOutgoing(
+        cur && cur.type !== "video" ? { item: cur, dir: "next" } : null,
+      )
       setNavDir("next")
       setLightboxIndex(ni)
       clearTimeout(outTimer)
       outTimer = setTimeout(() => setOutgoing(null), 360)
       const item = flatItems()[ni]
       if (item?.type === "text") fetchTextContent(item)
-      syncGridTo(ni)
+      preloadAdjacent(ni)
     }
   }
 
@@ -859,12 +928,7 @@ const MediaView = () => {
   /* ─── Helpers ─── */
   const TypeIcon = (props: { type: MediaItem["type"]; size?: string }) => {
     const m = { image: FiImage, video: FiFilm, gif: FiImage, text: FiType }
-    const c = {
-      image: "$success9",
-      video: "$danger9",
-      gif: "$warning9",
-      text: "$info9",
-    }
+    const c = MV.dot
     return (
       <Box
         as={m[props.type]}
@@ -884,18 +948,18 @@ const MediaView = () => {
           alignItems="center"
           gap="$2"
           pb="$3"
-          borderBottom="1px solid $neutral5"
+          borderBottom={`1px solid ${MV.hairline}`}
         >
           <Box
             as={AiOutlineFolder}
             boxSize="$5"
-            color="$primary9"
+            color={MV.accent}
             flexShrink={0}
           />
           <Text
             size="base"
             fontWeight="$semibold"
-            color="$neutral12"
+            color={MV.label}
             flex={1}
             css={{
               whiteSpace: "nowrap",
@@ -906,14 +970,21 @@ const MediaView = () => {
           >
             {row.group.displayName}
           </Text>
-          <Badge
-            colorScheme="neutral"
-            variant="subtle"
-            rounded="$full"
-            fontSize="xs"
+          <Box
+            as="span"
+            css={{
+              background: "rgba(0,0,0,0.05)",
+              color: MV.label2,
+              fontSize: "11px",
+              fontWeight: "$medium",
+              lineHeight: 1,
+              padding: "4px 9px",
+              borderRadius: "999px",
+              flexShrink: 0,
+            }}
           >
             {row.group.items.length}
-          </Badge>
+          </Box>
         </Box>
       )
     }
@@ -931,89 +1002,96 @@ const MediaView = () => {
         }
       })
       return (
-        <Box
-          ref={cardEl}
-          data-media-card={idx().toString()}
-          rounded="$xl"
-          overflow="hidden"
-          cursor="pointer"
-          border="1px solid"
-          borderColor={focused() ? "$primary7" : "$neutral6"}
-          bg="$neutral1"
-          pb="$3"
-          transition="transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease"
-          boxShadow={
-            focused()
-              ? "0 0 0 3px $colors$primary4, 0 8px 22px $colors$neutral6"
-              : "none"
-          }
-          _hover={{
-            transform: "translateY(-2px)",
-            boxShadow: "0 10px 24px $colors$neutral6",
-            borderColor: "$primary6",
-          }}
-          onClick={() => openLightbox(idx())}
-        >
+        <Box pb="$2_5">
           <Box
-            display="flex"
-            alignItems="center"
-            gap="$2"
-            px="$4"
-            py="$2_5"
-            borderBottom="1px solid $neutral5"
-            bg="$neutral3"
+            ref={cardEl}
+            data-media-card={idx().toString()}
+            rounded="$xl"
+            overflow="hidden"
+            cursor="pointer"
+            border="1px solid"
+            borderColor={focused() ? "rgba(0,122,255,0.45)" : MV.hairline}
+            bg={MV.surface}
+            pb="$3"
+            transition="transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease"
+            boxShadow={
+              focused()
+                ? `0 0 0 3px rgba(0,122,255,0.25), ${MV.shadowCard}`
+                : MV.shadowCard
+            }
+            _hover={{
+              transform: "translateY(-2px)",
+              boxShadow: MV.shadowCardHover,
+              borderColor: "rgba(0,0,0,0.12)",
+            }}
+            onClick={() => openLightbox(idx())}
           >
-            <Box as={FiType} boxSize="16px" color="$info9" flexShrink={0} />
-            <Text
-              size="sm"
-              fontWeight="$bold"
-              color="$neutral12"
-              flex={1}
-              css={{ wordBreak: "break-all", lineHeight: "1.35" }}
+            <Box
+              display="flex"
+              alignItems="center"
+              gap="$2"
+              px="$4"
+              py="$2_5"
+              borderBottom={`1px solid ${MV.hairline}`}
+              bg="rgba(0,0,0,0.02)"
             >
-              {item.name}
-            </Text>
-            <Text size="xs" color="$neutral10">
-              {formatSize(item.size)}
-            </Text>
-          </Box>
-          <Box px="$4" pt="$3" css={{ userSelect: "text" }}>
-            <Show
-              when={content() !== undefined}
-              fallback={
-                <Box display="flex" alignItems="center" gap="$2" py="$2">
-                  <Spinner size="sm" />
-                  <Text size="xs" color="$neutral10">
-                    Loading…
-                  </Text>
-                </Box>
-              }
-            >
+              <Box
+                as={FiType}
+                boxSize="16px"
+                color={MV.dot.text}
+                flexShrink={0}
+              />
+              <Text
+                size="sm"
+                fontWeight="$bold"
+                color={MV.label}
+                flex={1}
+                css={{ wordBreak: "break-all", lineHeight: "1.35" }}
+              >
+                {item.name}
+              </Text>
+              <Text size="xs" color={MV.label3}>
+                {formatSize(item.size)}
+              </Text>
+            </Box>
+            <Box px="$4" pt="$4" css={{ userSelect: "text" }}>
               <Show
-                when={content()}
+                when={content() !== undefined}
                 fallback={
-                  <Text size="sm" color="$neutral9" fontStyle="italic">
-                    (empty file)
-                  </Text>
+                  <Box display="flex" alignItems="center" gap="$2" py="$2">
+                    <Spinner size="sm" />
+                    <Text size="xs" color={MV.label3}>
+                      Loading…
+                    </Text>
+                  </Box>
                 }
               >
-                <Box
-                  class="markdown-body word-wrap"
-                  as="pre"
-                  m={0}
-                  css={{
-                    whiteSpace: "pre-wrap",
-                    wordBreak: "break-word",
-                    fontSize: "16px",
-                    lineHeight: "1.6",
-                    fontFamily:
-                      "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif",
-                  }}
+                <Show
+                  when={content()}
+                  fallback={
+                    <Text size="sm" color={MV.label3} fontStyle="italic">
+                      (empty file)
+                    </Text>
+                  }
                 >
-                  {content()}
-                </Box>
+                  <Box
+                    class="markdown-body word-wrap"
+                    as="pre"
+                    m={0}
+                    css={{
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      fontSize: "16px",
+                      lineHeight: "1.6",
+                      fontFamily:
+                        "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif",
+                    }}
+                  >
+                    {content()}
+                  </Box>
+                </Show>
               </Show>
-            </Show>
+            </Box>
           </Box>
         </Box>
       )
@@ -1046,23 +1124,23 @@ const MediaView = () => {
                 overflow="hidden"
                 cursor="pointer"
                 border="1px solid"
-                borderColor={focused() ? "$primary7" : "$neutral6"}
-                bg="$neutral1"
-                transition="transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease"
+                borderColor={focused() ? "rgba(0,122,255,0.45)" : MV.hairline}
+                bg={MV.surface}
+                transition="transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease"
                 boxShadow={
                   focused()
-                    ? "0 0 0 3px $colors$primary4, 0 8px 22px $colors$neutral6"
-                    : "none"
+                    ? `0 0 0 3px rgba(0,122,255,0.25), ${MV.shadowCard}`
+                    : MV.shadowCard
                 }
                 _hover={{
-                  transform: "translateY(-3px)",
-                  boxShadow: "0 12px 26px $colors$neutral6",
-                  borderColor: "$primary6",
+                  transform: "translateY(-2px)",
+                  boxShadow: MV.shadowCardHover,
+                  borderColor: "rgba(0,0,0,0.12)",
                 }}
                 onClick={() => openLightbox(idx())}
               >
                 <Box
-                  bg="$neutral4"
+                  bg="rgba(0,0,0,0.03)"
                   pos="relative"
                   overflow="hidden"
                   css={{ aspectRatio: "4 / 3" }}
@@ -1082,6 +1160,8 @@ const MediaView = () => {
                       h="$full"
                       objectFit="cover"
                       loading="lazy"
+                      decoding="async"
+                      draggable={false}
                       fallback={
                         <Center h="$full">
                           <Spinner size="sm" />
@@ -1113,29 +1193,49 @@ const MediaView = () => {
                       </Box>
                     </Show>
                   </Show>
-                  <Box pos="absolute" top="$1" right="$1">
-                    <Badge
-                      colorScheme={
-                        item.type === "image"
-                          ? "success"
-                          : item.type === "video"
-                            ? "danger"
-                            : "warning"
-                      }
-                      variant="solid"
-                      rounded="$md"
-                      fontSize="xs"
-                      textTransform="uppercase"
-                    >
-                      {item.type}
-                    </Badge>
+                  <Box
+                    pos="absolute"
+                    top="$1"
+                    right="$1"
+                    display="flex"
+                    alignItems="center"
+                    gap="5px"
+                    px="7px"
+                    py="4px"
+                    rounded="$full"
+                    css={{
+                      // translucent white without backdrop-filter: dozens of
+                      // these are visible at once and per-badge blur hurts
+                      // scrolling
+                      background: "rgba(255,255,255,0.85)",
+                      border: `1px solid ${MV.hairline}`,
+                      fontSize: "10px",
+                      fontWeight: "$semibold",
+                      lineHeight: 1,
+                      letterSpacing: "0.05em",
+                      textTransform: "uppercase",
+                      color: MV.label2,
+                      pointerEvents: "none",
+                    }}
+                  >
+                    <Box
+                      as="span"
+                      css={{
+                        width: "6px",
+                        height: "6px",
+                        borderRadius: "50%",
+                        background: MV.dot[item.type],
+                        flexShrink: 0,
+                      }}
+                    />
+                    {item.type}
                   </Box>
                 </Box>
-                <Box p="$2">
+                <Box p="$3" pt="$2_5">
                   <Text
                     size="xs"
                     fontWeight="$semibold"
-                    color="$neutral12"
+                    color={MV.label}
                     css={{
                       display: "-webkit-box",
                       "-webkit-line-clamp": "2",
@@ -1147,7 +1247,7 @@ const MediaView = () => {
                   >
                     {item.name}
                   </Text>
-                  <Text size="xs" color="$neutral11" mt="2px">
+                  <Text size="xs" color={MV.label3} mt="4px">
                     {formatSize(item.size)}
                   </Text>
                 </Box>
@@ -1167,22 +1267,26 @@ const MediaView = () => {
       right="0"
       bottom="0"
       left="0"
-      bg="$loContrast"
+      bg={MV.bg}
       zIndex={1000}
       display="flex"
       flexDirection="column"
       overflow="hidden"
+      css={{
+        fontFamily:
+          "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'PingFang SC', 'Helvetica Neue', 'Segoe UI', 'Microsoft YaHei', sans-serif",
+      }}
     >
       {/* ═══════ Top Bar ═══════ */}
       <Box
         flexShrink={0}
         zIndex={10}
-        bg={glassBg()}
-        borderBottom={`1px solid ${glassBorder()}`}
+        bg={MV.glass}
+        borderBottom={`1px solid ${MV.hairline}`}
         css={{
-          backdropFilter: "blur(14px) saturate(160%)",
-          WebkitBackdropFilter: "blur(14px) saturate(160%)",
-          boxShadow: "0 1px 0 rgba(0,0,0,0.02), 0 6px 20px rgba(0,0,0,0.05)",
+          backdropFilter: MV.glassBlur,
+          WebkitBackdropFilter: MV.glassBlur,
+          boxShadow: "0 1px 2px rgba(0,0,0,0.03)",
         }}
       >
         <Box display="flex" alignItems="center" gap="$2" px="$3" py="$2">
@@ -1191,23 +1295,25 @@ const MediaView = () => {
             icon={<BsArrowLeft />}
             variant="ghost"
             size="sm"
+            color={MV.label2}
             onClick={() => to(encodePath(folderPath(), true))}
           />
           <Box flex={1} overflow="hidden">
             <Text
               size="sm"
               fontWeight="$bold"
+              color={MV.label}
               css={{
                 whiteSpace: "nowrap",
                 overflow: "hidden",
                 textOverflow: "ellipsis",
               }}
             >
-              📂 Media View
+              Media
             </Text>
             <Text
               size="xs"
-              color="$neutral11"
+              color={MV.label2}
               css={{
                 whiteSpace: "nowrap",
                 overflow: "hidden",
@@ -1218,7 +1324,7 @@ const MediaView = () => {
             </Text>
           </Box>
           <Show when={scanning()}>
-            <Spinner size="sm" color="$primary9" />
+            <Spinner size="sm" color={MV.accent} />
           </Show>
           <Tooltip label="Refresh (r)" placement="bottom">
             <IconButton
@@ -1226,6 +1332,7 @@ const MediaView = () => {
               icon={<AiOutlineReload />}
               variant="ghost"
               size="sm"
+              color={MV.label2}
               onClick={startScan}
               disabled={scanning()}
             />
@@ -1236,6 +1343,7 @@ const MediaView = () => {
               icon={<BsQuestionCircle />}
               variant="ghost"
               size="sm"
+              color={MV.label2}
               onClick={() => setShowHelp(true)}
             />
           </Tooltip>
@@ -1249,18 +1357,28 @@ const MediaView = () => {
           pb="$2"
           flexWrap="wrap"
         >
-          <InputGroup size="sm" w={isMobile ? "100%" : "220px"} flexShrink={0}>
+          <InputGroup
+            size="sm"
+            w={containerWidth() < PHONE_W ? "100%" : "220px"}
+            flexShrink={0}
+          >
             <InputLeftElement pointerEvents="none">
-              <Box as={AiOutlineSearch} color="$neutral11" />
+              <Box as={AiOutlineSearch} color={MV.label3} />
             </InputLeftElement>
             <Input
               placeholder="Filter files…"
               value={search()}
               onInput={(e) => setSearch(e.currentTarget.value)}
+              css={{
+                background: MV.surface,
+                borderColor: MV.hairline,
+                color: MV.label,
+                "&::placeholder": { color: MV.label3 },
+              }}
             />
           </InputGroup>
-          {!isMobile && <Box flex={1} />}
-          <Text size="xs" color="$neutral11" flexShrink={0}>
+          {containerWidth() >= PHONE_W && <Box flex={1} />}
+          <Text size="xs" color={MV.label2} flexShrink={0}>
             {flatItems().length} items
             <Show when={subDirs().length > 0}>
               {" · "}
@@ -1273,14 +1391,43 @@ const MediaView = () => {
             <Popover placement="bottom-start">
               {({ onClose }) => (
                 <>
-                  <PopoverTrigger as={Button} variant="outline" size="sm">
+                  <PopoverTrigger
+                    as={Button}
+                    variant="outline"
+                    size="sm"
+                    css={{
+                      background: MV.surface,
+                      borderColor: MV.hairline,
+                      color: MV.label,
+                    }}
+                  >
                     <Box as={AiOutlineFolder} boxSize="14px" flexShrink={0} />
                     Folders
-                    <Badge colorScheme="neutral" variant="subtle" ml="$1">
+                    <Box
+                      as="span"
+                      css={{
+                        background: "rgba(0,0,0,0.05)",
+                        color: MV.label2,
+                        fontSize: "11px",
+                        fontWeight: "$medium",
+                        lineHeight: 1,
+                        padding: "3px 8px",
+                        borderRadius: "999px",
+                        marginLeft: "$1",
+                      }}
+                    >
                       {subDirs().length}
-                    </Badge>
+                    </Box>
                   </PopoverTrigger>
-                  <PopoverContent w="280px">
+                  <PopoverContent
+                    w="280px"
+                    css={{
+                      background: MV.surface,
+                      border: `1px solid ${MV.hairline}`,
+                      boxShadow: MV.shadowPop,
+                      borderRadius: "14px",
+                    }}
+                  >
                     <PopoverBody p="$1" display="flex" flexDirection="column">
                       <Input
                         placeholder="Filter folders…"
@@ -1288,6 +1435,12 @@ const MediaView = () => {
                         onInput={(e) => setDirFilter(e.currentTarget.value)}
                         size="sm"
                         mb="$1"
+                        css={{
+                          background: MV.surface,
+                          borderColor: MV.hairline,
+                          color: MV.label,
+                          "&::placeholder": { color: MV.label3 },
+                        }}
                       />
                       <Box maxH="50vh" overflowY="auto">
                         <For each={filteredSubDirs()}>
@@ -1302,7 +1455,7 @@ const MediaView = () => {
                                 py="$1_5"
                                 rounded="$md"
                                 cursor="pointer"
-                                _hover={{ bg: "$neutral3" }}
+                                _hover={{ bg: "rgba(0,0,0,0.04)" }}
                                 onClick={() => {
                                   onClose()
                                   setDirFilter("")
@@ -1312,11 +1465,12 @@ const MediaView = () => {
                                 <Box
                                   as={AiOutlineFolder}
                                   boxSize="14px"
-                                  color="$primary9"
+                                  color={MV.accent}
                                   flexShrink={0}
                                 />
                                 <Text
                                   size="sm"
+                                  color={MV.label}
                                   css={{ wordBreak: "break-all" }}
                                 >
                                   {name}
@@ -1326,7 +1480,7 @@ const MediaView = () => {
                           }}
                         </For>
                         <Show when={filteredSubDirs().length === 0}>
-                          <Text size="xs" color="$neutral10" px="$2" py="$2">
+                          <Text size="xs" color={MV.label3} px="$2" py="$2">
                             No folders match
                           </Text>
                         </Show>
@@ -1342,8 +1496,8 @@ const MediaView = () => {
 
       {/* ═══════ Scanning Progress ═══════ */}
       <Show when={scanMsg()}>
-        <Box px="$3" py="$1" bg="$primary2" flexShrink={0}>
-          <Text size="xs" color="$primary11">
+        <Box px="$3" py="$1" bg="rgba(0,122,255,0.06)" flexShrink={0}>
+          <Text size="xs" css={{ color: MV.accent }}>
             {scanMsg()}… ({items().length} items found)
           </Text>
         </Box>
@@ -1366,7 +1520,7 @@ const MediaView = () => {
               <Box textAlign="center">
                 <FullLoading />
                 <Show when={scanMsg()}>
-                  <Text size="sm" color="$neutral11" mt="$2">
+                  <Text size="sm" color={MV.label2} mt="$2">
                     {scanMsg()}
                   </Text>
                 </Show>
@@ -1382,11 +1536,11 @@ const MediaView = () => {
                   <Box
                     as={AiOutlineFolder}
                     boxSize="$16"
-                    color="$neutral8"
+                    color={MV.label3}
                     mx="auto"
                     mb="$3"
                   />
-                  <Text size="lg" color="$neutral11">
+                  <Text size="lg" color={MV.label2}>
                     {items().length === 0
                       ? "No media files found"
                       : "No files match filter"}
@@ -1446,6 +1600,8 @@ const MediaView = () => {
                   maxH="90vh"
                   objectFit="contain"
                   rounded="$lg"
+                  decoding="async"
+                  draggable={false}
                   onClick={(e: MouseEvent) => e.stopPropagation()}
                 />
               )
@@ -1474,8 +1630,10 @@ const MediaView = () => {
                   w="min(800px, 90%)"
                   maxH="85vh"
                   overflowY="auto"
-                  bg="$neutral2"
+                  bg={MV.surface}
                   rounded="$lg"
+                  border={`1px solid ${MV.hairline}`}
+                  boxShadow={MV.shadowPop}
                   p="$4"
                   onClick={(e: MouseEvent) => e.stopPropagation()}
                 >
@@ -1492,7 +1650,7 @@ const MediaView = () => {
                       fontFamily="$mono"
                       fontSize="14px"
                       lineHeight="1.7"
-                      color="$neutral12"
+                      color={MV.label}
                       m={0}
                       css={{
                         whiteSpace: "pre-wrap",
@@ -1537,7 +1695,7 @@ const MediaView = () => {
                 right="0"
                 bottom="0"
                 left="0"
-                css={{ background: "#000" }}
+                css={{ background: MV.bg }}
               />
               {/* media stage — full screen; swipe to browse, tap to close */}
               <Box
@@ -1637,7 +1795,7 @@ const MediaView = () => {
                   )}
                 </For>
               </Box>
-              {/* top overlay — filename + close (gradient, click-through) */}
+              {/* top overlay — frosted bar with filename + close (click-through) */}
               <Box
                 pos="absolute"
                 top="0"
@@ -1646,8 +1804,10 @@ const MediaView = () => {
                 zIndex={5}
                 css={{
                   pointerEvents: "none",
-                  background:
-                    "linear-gradient(to bottom, rgba(0,0,0,0.6), transparent)",
+                  background: MV.glass,
+                  backdropFilter: MV.glassBlur,
+                  WebkitBackdropFilter: MV.glassBlur,
+                  borderBottom: `1px solid ${MV.hairline}`,
                 }}
               >
                 <Box
@@ -1660,13 +1820,12 @@ const MediaView = () => {
                   <Text
                     flex={1}
                     size="sm"
-                    color="white"
+                    color={MV.label}
                     fontWeight="$semibold"
                     css={{
                       whiteSpace: "nowrap",
                       overflow: "hidden",
                       textOverflow: "ellipsis",
-                      textShadow: "0 1px 4px rgba(0,0,0,0.6)",
                     }}
                   >
                     {item()?.name}
@@ -1675,19 +1834,19 @@ const MediaView = () => {
                     aria-label="Close"
                     icon={<BsX />}
                     variant="ghost"
-                    color="white"
+                    color={MV.label}
                     size="lg"
                     rounded="$full"
                     onClick={closeLightbox}
                     css={{
                       pointerEvents: "auto",
-                      background: "rgba(255,255,255,0.14)",
-                      "&:hover": { background: "rgba(255,255,255,0.26)" },
+                      background: "rgba(0,0,0,0.05)",
+                      "&:hover": { background: "rgba(0,0,0,0.10)" },
                     }}
                   />
                 </Box>
               </Box>
-              {/* bottom overlay — counter + hints (gradient, click-through) */}
+              {/* bottom overlay — frosted bar with counter + hints (click-through) */}
               <Box
                 pos="absolute"
                 bottom="0"
@@ -1696,8 +1855,10 @@ const MediaView = () => {
                 zIndex={5}
                 css={{
                   pointerEvents: "none",
-                  background:
-                    "linear-gradient(to top, rgba(0,0,0,0.6), transparent)",
+                  background: MV.glass,
+                  backdropFilter: MV.glassBlur,
+                  WebkitBackdropFilter: MV.glassBlur,
+                  borderTop: `1px solid ${MV.hairline}`,
                 }}
               >
                 <Box
@@ -1710,8 +1871,7 @@ const MediaView = () => {
                   <Text
                     size="xs"
                     css={{
-                      color: "rgba(255,255,255,0.75)",
-                      textShadow: "0 1px 4px rgba(0,0,0,0.6)",
+                      color: MV.label2,
                       whiteSpace: "nowrap",
                     }}
                   >
@@ -1721,31 +1881,31 @@ const MediaView = () => {
                       {formatSize(item()!.size)}
                     </Show>
                   </Text>
-                  <Show when={!isMobile}>
+                  <Show when={FINE_POINTER && containerWidth() >= PHONE_W}>
                     <Box
                       flex={1}
                       display="flex"
                       justifyContent="flex-end"
                       gap="$3"
                     >
-                      <Text size="xs" css={{ color: "rgba(255,255,255,0.5)" }}>
+                      <Text size="xs" css={{ color: MV.label3 }}>
                         <Kbd
                           css={{
-                            background: "rgba(255,255,255,0.1)",
-                            borderColor: "rgba(255,255,255,0.2)",
-                            color: "rgba(255,255,255,0.7)",
+                            background: "rgba(0,0,0,0.05)",
+                            borderColor: MV.hairline,
+                            color: MV.label2,
                           }}
                         >
                           ← →
                         </Kbd>{" "}
                         prev/next
                       </Text>
-                      <Text size="xs" css={{ color: "rgba(255,255,255,0.5)" }}>
+                      <Text size="xs" css={{ color: MV.label3 }}>
                         <Kbd
                           css={{
-                            background: "rgba(255,255,255,0.1)",
-                            borderColor: "rgba(255,255,255,0.2)",
-                            color: "rgba(255,255,255,0.7)",
+                            background: "rgba(0,0,0,0.05)",
+                            borderColor: MV.hairline,
+                            color: MV.label2,
                           }}
                         >
                           ↑↓ / Esc
@@ -1756,14 +1916,15 @@ const MediaView = () => {
                   </Show>
                 </Box>
               </Box>
-              {/* desktop nav arrows — left/right to browse (no touch on desktop) */}
-              <Show when={!isMobile}>
+              {/* wide screens (incl. tablets — tap works there too): left/right
+                  arrows to browse; narrow phones swipe instead */}
+              <Show when={containerWidth() >= PHONE_W}>
                 <Show when={idx() > 0}>
                   <IconButton
                     aria-label="Previous"
                     icon={<BsChevronLeft />}
                     variant="ghost"
-                    color="white"
+                    color={MV.label}
                     size="lg"
                     pos="absolute"
                     left="$3"
@@ -1775,8 +1936,11 @@ const MediaView = () => {
                       lightboxPrev()
                     }}
                     css={{
-                      background: "rgba(255,255,255,0.14)",
-                      "&:hover": { background: "rgba(255,255,255,0.26)" },
+                      background: "rgba(255,255,255,0.72)",
+                      backdropFilter: MV.glassBlur,
+                      WebkitBackdropFilter: MV.glassBlur,
+                      border: `1px solid ${MV.hairline}`,
+                      "&:hover": { background: "rgba(255,255,255,0.95)" },
                     }}
                     rounded="$full"
                   />
@@ -1786,7 +1950,7 @@ const MediaView = () => {
                     aria-label="Next"
                     icon={<BsChevronRight />}
                     variant="ghost"
-                    color="white"
+                    color={MV.label}
                     size="lg"
                     pos="absolute"
                     right="$3"
@@ -1798,8 +1962,11 @@ const MediaView = () => {
                       lightboxNext()
                     }}
                     css={{
-                      background: "rgba(255,255,255,0.14)",
-                      "&:hover": { background: "rgba(255,255,255,0.26)" },
+                      background: "rgba(255,255,255,0.72)",
+                      backdropFilter: MV.glassBlur,
+                      WebkitBackdropFilter: MV.glassBlur,
+                      border: `1px solid ${MV.hairline}`,
+                      "&:hover": { background: "rgba(255,255,255,0.95)" },
                     }}
                     rounded="$full"
                   />
@@ -1830,7 +1997,7 @@ const MediaView = () => {
             right="0"
             bottom="0"
             left="0"
-            css={{ background: "rgba(0,0,0,0.5)" }}
+            css={{ background: "rgba(0,0,0,0.24)" }}
             onClick={() => {
               setShowJump(false)
               setJumpInput("")
@@ -1838,14 +2005,19 @@ const MediaView = () => {
           />
           <Box
             pos="relative"
-            bg="$loContrast"
             rounded="$xl"
             p="$4"
-            w="380px"
-            shadow="$xl"
-            border="1px solid $neutral6"
+            w="min(380px, calc(100vw - 32px))"
+            css={{
+              background: "rgba(255,255,255,0.86)",
+              backdropFilter: "blur(24px) saturate(180%)",
+              WebkitBackdropFilter: "blur(24px) saturate(180%)",
+              border: `1px solid ${MV.hairline}`,
+              boxShadow: MV.shadowPop,
+              color: MV.label,
+            }}
           >
-            <Text size="sm" fontWeight="$bold" mb="$2">
+            <Text size="sm" fontWeight="$bold" color={MV.label} mb="$2">
               Jump to item
             </Text>
             <Input
@@ -1865,8 +2037,14 @@ const MediaView = () => {
               }}
               size="sm"
               autofocus
+              css={{
+                background: MV.surface,
+                borderColor: MV.hairline,
+                color: MV.label,
+                "&::placeholder": { color: MV.label3 },
+              }}
             />
-            <Text size="xs" color="$neutral11" mt="$1">
+            <Text size="xs" color={MV.label3} mt="$1">
               Enter to jump, Escape to cancel
             </Text>
           </Box>
@@ -1892,22 +2070,27 @@ const MediaView = () => {
             right="0"
             bottom="0"
             left="0"
-            css={{ background: "rgba(0,0,0,0.5)" }}
+            css={{ background: "rgba(0,0,0,0.24)" }}
             onClick={() => setShowHelp(false)}
           />
           <Box
             pos="relative"
-            bg="$loContrast"
             rounded="$xl"
             p="$5"
-            w="440px"
-            shadow="$xl"
-            border="1px solid $neutral6"
+            w="min(440px, calc(100vw - 32px))"
             maxH="80vh"
             overflowY="auto"
+            css={{
+              background: "rgba(255,255,255,0.86)",
+              backdropFilter: "blur(24px) saturate(180%)",
+              WebkitBackdropFilter: "blur(24px) saturate(180%)",
+              border: `1px solid ${MV.hairline}`,
+              boxShadow: MV.shadowPop,
+              color: MV.label,
+            }}
           >
-            <Text size="lg" fontWeight="$bold" mb="$4">
-              ⌨️ Keyboard Shortcuts
+            <Text size="lg" fontWeight="$bold" color={MV.label} mb="$4">
+              Keyboard Shortcuts
             </Text>
             <For
               each={[
@@ -1943,7 +2126,7 @@ const MediaView = () => {
             >
               {(section) => (
                 <Box mb="$4">
-                  <Text size="sm" fontWeight="$bold" color="$primary11" mb="$2">
+                  <Text size="sm" fontWeight="$bold" color={MV.accent} mb="$2">
                     {section.title}
                   </Text>
                   <For each={section.items}>
@@ -1954,10 +2137,19 @@ const MediaView = () => {
                         mb="$1_5"
                         gap="$3"
                       >
-                        <Kbd minW="100px" textAlign="center" fontSize="xs">
+                        <Kbd
+                          minW="100px"
+                          textAlign="center"
+                          fontSize="xs"
+                          css={{
+                            background: "rgba(0,0,0,0.04)",
+                            borderColor: MV.hairline,
+                            color: MV.label2,
+                          }}
+                        >
                           {keys}
                         </Kbd>
-                        <Text size="xs" color="$neutral11">
+                        <Text size="xs" color={MV.label2}>
                           {desc}
                         </Text>
                       </Box>
