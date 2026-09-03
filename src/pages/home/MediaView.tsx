@@ -13,6 +13,7 @@ import {
   Input,
   InputGroup,
   InputLeftElement,
+  InputRightElement,
   IconButton,
   Button,
   Center,
@@ -40,6 +41,7 @@ import {
 } from "solid-icons/ai"
 import { FiImage, FiFilm, FiType } from "solid-icons/fi"
 import { FullLoading } from "~/components"
+import axios from "axios"
 import { useRouter } from "~/hooks"
 import { password } from "~/store"
 import { ObjType } from "~/types"
@@ -226,6 +228,9 @@ const MediaView = () => {
   const [loading, setLoading] = createSignal(true)
   const [scanning, setScanning] = createSignal(false)
   const [scanMsg, setScanMsg] = createSignal("")
+  // set when a scan failed outright (backend timeout/error) so the empty
+  // state can say so instead of claiming the folder has no media
+  const [scanError, setScanError] = createSignal<string | null>(null)
   const [search, setSearch] = createSignal("")
   const [subDirs, setSubDirs] = createSignal<string[]>([])
   const [dirFilter, setDirFilter] = createSignal("")
@@ -414,6 +419,9 @@ const MediaView = () => {
   } | null>(null)
   const [showHelp, setShowHelp] = createSignal(false)
   const [showJump, setShowJump] = createSignal(false)
+  // toolbar search: collapsed to an icon until invoked — a filter that is
+  // not filtering should not occupy the bar
+  const [searchOpen, setSearchOpen] = createSignal(false)
   const [jumpInput, setJumpInput] = createSignal("")
   const [textCache, setTextCache] = createSignal<Record<string, string>>({})
   const [cols, setCols] = createSignal(
@@ -431,6 +439,7 @@ const MediaView = () => {
   let scrollRef: HTMLDivElement | undefined
   let abortCtrl: AbortController | undefined
   let jumpInputRef: HTMLInputElement | undefined
+  let searchInputRef: HTMLInputElement | undefined
   let resizeObserver: ResizeObserver | undefined
   let touchStartX = 0
   let touchStartY = 0
@@ -984,7 +993,24 @@ const MediaView = () => {
     const isRoot = path === folderPath()
     setScanMsg(`Scanning: ${path}`)
 
-    const resp = await fsList(path, password(), 1, 0, false)
+    // per-request timeout + supersession: the cancel token is linked to the
+    // scan's AbortSignal, so a newer scan cancels in-flight requests for the
+    // superseded one immediately instead of leaving them to land later
+    const cancelSrc = axios.CancelToken.source()
+    const onScanAbort = () => cancelSrc.cancel("scan superseded")
+    if (signal.aborted) onScanAbort()
+    else signal.addEventListener("abort", onScanAbort)
+    const timeoutId = setTimeout(
+      () => cancelSrc.cancel(`timeout scanning ${path}`),
+      15000,
+    )
+    let resp
+    try {
+      resp = await fsList(path, password(), 1, 0, false, cancelSrc.token)
+    } finally {
+      clearTimeout(timeoutId)
+      signal.removeEventListener("abort", onScanAbort)
+    }
     if (signal.aborted) return
 
     let data: any
@@ -1047,22 +1073,35 @@ const MediaView = () => {
 
   const startScan = async () => {
     abortCtrl?.abort()
-    abortCtrl = new AbortController()
+    // invocation-local ownership: this scan's controller is captured so its
+    // catch/finally only mutate shared state while THIS scan is still the
+    // current one — a superseded scan terminating late must not flush the
+    // newer scan's items or clear its loading state
+    const myCtrl = new AbortController()
+    abortCtrl = myCtrl
     scanItems = []
     scanFlushPending = false
     clearTimeout(scanFlushTimer)
     setSubDirs([])
     setItems([])
     setTextCache({})
+    setScanError(null)
     setLoading(true)
     setScanning(true)
     setFocusIndex(-1)
 
     try {
-      await fetchFolder(folderPath(), abortCtrl.signal)
+      await fetchFolder(folderPath(), myCtrl.signal)
     } catch (e) {
-      if (!abortCtrl.signal.aborted) console.error("Media scan error:", e)
+      // only the owner reports: superseded scans abort by design
+      if (abortCtrl === myCtrl && !myCtrl.signal.aborted) {
+        console.error("Media scan error:", e)
+        setScanError(
+          e instanceof Error ? e.message : axios.isCancel(e) ? "timeout" : "",
+        )
+      }
     } finally {
+      if (abortCtrl !== myCtrl) return // a newer scan owns the state now
       // final flush so the last batch isn't held back by the throttle
       clearTimeout(scanFlushTimer)
       scanFlushPending = false
@@ -1713,6 +1752,7 @@ const MediaView = () => {
             // a broken thumbnail swaps to a static type-icon placeholder
             // instead of an empty gray tile
             const [thumbErr, setThumbErr] = createSignal(false)
+            const [vidErr, setVidErr] = createSignal(false)
             const thumbUrl = () => {
               if (item.type === "gif") return link()
               if (item.type === "image") return item.thumb || link()
@@ -1730,9 +1770,28 @@ const MediaView = () => {
                   <Show
                     when={thumbUrl() && !thumbErr()}
                     fallback={
-                      <Center h="$full">
-                        <TypeIcon type={item.type} />
-                      </Center>
+                      // a video with no server thumbnail shows its own first
+                      // frame — a metadata-only <video> needs no canvas and
+                      // no CORS gymnastics, the browser just paints frame 0
+                      item.type === "video" && !vidErr() ? (
+                        <video
+                          src={link() + "#t=0.1"}
+                          preload="metadata"
+                          muted
+                          playsinline
+                          onError={() => setVidErr(true)}
+                          style={{
+                            width: "100%",
+                            height: "100%",
+                            "object-fit": "cover",
+                            "pointer-events": "none",
+                          }}
+                        />
+                      ) : (
+                        <Center h="$full">
+                          <TypeIcon type={item.type} />
+                        </Center>
+                      )
                     }
                   >
                     <img
@@ -1786,8 +1845,10 @@ const MediaView = () => {
       }}
     >
       {/* ═══════ Top Bar ═══════ */}
-      {/* one compact toolbar row on desktop (search, folders and the count
-          join the title); phones keep the stacked rows so nothing squeezes */}
+      {/* minimal-but-not-bare toolbar: icon-only by default; the search
+          field exists only while it is being used (or holds a filter), and
+          folders live behind their icon with a count badge. One row at
+          every size — phones get the expanded search as a full-width row. */}
       <Box
         flexShrink={0}
         zIndex={10}
@@ -1800,7 +1861,7 @@ const MediaView = () => {
           boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
         }}
       >
-        <Box display="flex" alignItems="center" gap="$2" px="$3" py="$2">
+        <Box display="flex" alignItems="center" gap="$1_5" px="$3" py="$2">
           <IconButton
             aria-label="Back"
             icon={<BsArrowLeft />}
@@ -1834,127 +1895,170 @@ const MediaView = () => {
               {folderPath()}
             </Text>
           </Box>
-          <Show when={containerWidth() >= PHONE_W}>
-            <InputGroup size="sm" w="200px" flexShrink={0}>
-              <InputLeftElement pointerEvents="none">
-                <Box as={AiOutlineSearch} color={MV.label3} />
-              </InputLeftElement>
-              <Input
-                placeholder="Filter files…"
-                value={search()}
-                onInput={(e) => setSearch(e.currentTarget.value)}
-                css={{
-                  background: MV.surface,
-                  borderColor: MV.hairline,
-                  color: MV.label,
-                  "&::placeholder": { color: MV.label3 },
-                }}
-              />
-            </InputGroup>
-            <Show when={subDirs().length > 0}>
-              <Popover placement="bottom-start">
-                {({ onClose }) => (
-                  <>
+          <Show when={searchOpen() || search()}>
+            <Show when={containerWidth() >= PHONE_W}>
+              <InputGroup size="sm" w="200px" flexShrink={0}>
+                <InputLeftElement pointerEvents="none">
+                  <Box as={AiOutlineSearch} color={MV.label3} />
+                </InputLeftElement>
+                <Input
+                  ref={searchInputRef}
+                  placeholder="Filter files…"
+                  value={search()}
+                  onInput={(e) => setSearch(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      if (search()) setSearch("")
+                      else {
+                        setSearchOpen(false)
+                        e.currentTarget.blur()
+                      }
+                    }
+                  }}
+                  css={{
+                    background: MV.surface,
+                    borderColor: MV.hairline,
+                    color: MV.label,
+                    "&::placeholder": { color: MV.label3 },
+                  }}
+                />
+                <Show when={search()}>
+                  <InputRightElement>
+                    <Box
+                      as="button"
+                      type="button"
+                      aria-label="Clear filter"
+                      color={MV.label3}
+                      cursor="pointer"
+                      background="none"
+                      border="none"
+                      padding={0}
+                      onClick={() => setSearch("")}
+                    >
+                      <Box as={BsX} />
+                    </Box>
+                  </InputRightElement>
+                </Show>
+              </InputGroup>
+            </Show>
+          </Show>
+          <Tooltip label="Filter files" placement="bottom">
+            <IconButton
+              aria-label="Filter files"
+              icon={<AiOutlineSearch />}
+              variant="ghost"
+              size="sm"
+              color={search() || searchOpen() ? MV.accent : MV.label2}
+              onClick={() => {
+                setSearchOpen((v) => !v)
+                setTimeout(() => searchInputRef?.focus(), 60)
+              }}
+            />
+          </Tooltip>
+          <Show when={subDirs().length > 0}>
+            <Popover placement="bottom-start">
+              {({ onClose }) => (
+                <>
+                  <Box pos="relative">
                     <PopoverTrigger
                       as={Button}
-                      variant="outline"
+                      variant="ghost"
                       size="sm"
-                      css={{
-                        background: MV.surface,
-                        borderColor: MV.hairline,
-                        color: MV.label,
-                      }}
+                      aria-label="Folders"
+                      css={{ color: MV.label2, px: "$1" }}
                     >
-                      <Box as={AiOutlineFolder} boxSize="14px" flexShrink={0} />
-                      Folders
-                      <Box
-                        as="span"
-                        css={{
-                          background: "rgba(0,0,0,0.05)",
-                          color: MV.label2,
-                          fontSize: "11px",
-                          fontWeight: "$medium",
-                          lineHeight: 1,
-                          padding: "3px 8px",
-                          borderRadius: "999px",
-                          marginLeft: "$1",
-                        }}
-                      >
-                        {subDirs().length}
-                      </Box>
+                      <Box as={AiOutlineFolder} boxSize="16px" />
                     </PopoverTrigger>
-                    <PopoverContent
-                      w="280px"
+                    <Box
+                      as="span"
+                      pos="absolute"
+                      top="-2px"
+                      right="-2px"
                       css={{
-                        background: MV.surface,
-                        border: `1px solid ${MV.hairline}`,
-                        boxShadow: MV.shadowPop,
-                        borderRadius: "14px",
+                        background: MV.accent,
+                        color: "#fff",
+                        fontSize: "9px",
+                        fontWeight: "$bold",
+                        lineHeight: 1,
+                        padding: "2.5px 5px",
+                        borderRadius: "999px",
+                        pointerEvents: "none",
                       }}
                     >
-                      <PopoverBody p="$1" display="flex" flexDirection="column">
-                        <Input
-                          placeholder="Filter folders…"
-                          value={dirFilter()}
-                          onInput={(e) => setDirFilter(e.currentTarget.value)}
-                          size="sm"
-                          mb="$1"
-                          css={{
-                            background: MV.surface,
-                            borderColor: MV.hairline,
-                            color: MV.label,
-                            "&::placeholder": { color: MV.label3 },
-                          }}
-                        />
-                        <Box maxH="50vh" overflowY="auto">
-                          <For each={filteredSubDirs()}>
-                            {(sub) => {
-                              const name = sub.split("/").pop() || sub
-                              return (
+                      {subDirs().length}
+                    </Box>
+                  </Box>
+                  <PopoverContent
+                    w="280px"
+                    css={{
+                      background: MV.surface,
+                      border: `1px solid ${MV.hairline}`,
+                      boxShadow: MV.shadowPop,
+                      borderRadius: "14px",
+                    }}
+                  >
+                    <PopoverBody p="$1" display="flex" flexDirection="column">
+                      <Input
+                        placeholder="Filter folders…"
+                        value={dirFilter()}
+                        onInput={(e) => setDirFilter(e.currentTarget.value)}
+                        size="sm"
+                        mb="$1"
+                        css={{
+                          background: MV.surface,
+                          borderColor: MV.hairline,
+                          color: MV.label,
+                          "&::placeholder": { color: MV.label3 },
+                        }}
+                      />
+                      <Box maxH="50vh" overflowY="auto">
+                        <For each={filteredSubDirs()}>
+                          {(sub) => {
+                            const name = sub.split("/").pop() || sub
+                            return (
+                              <Box
+                                display="flex"
+                                alignItems="center"
+                                gap="$2"
+                                px="$2"
+                                py="$1_5"
+                                rounded="$md"
+                                cursor="pointer"
+                                _hover={{ bg: "rgba(0,0,0,0.04)" }}
+                                onClick={() => {
+                                  onClose()
+                                  setDirFilter("")
+                                  scrollToFolder(sub)
+                                }}
+                              >
                                 <Box
-                                  display="flex"
-                                  alignItems="center"
-                                  gap="$2"
-                                  px="$2"
-                                  py="$1_5"
-                                  rounded="$md"
-                                  cursor="pointer"
-                                  _hover={{ bg: "rgba(0,0,0,0.04)" }}
-                                  onClick={() => {
-                                    onClose()
-                                    setDirFilter("")
-                                    scrollToFolder(sub)
-                                  }}
+                                  as={AiOutlineFolder}
+                                  boxSize="14px"
+                                  color={MV.accent}
+                                  flexShrink={0}
+                                />
+                                <Text
+                                  size="sm"
+                                  color={MV.label}
+                                  css={{ wordBreak: "break-all" }}
                                 >
-                                  <Box
-                                    as={AiOutlineFolder}
-                                    boxSize="14px"
-                                    color={MV.accent}
-                                    flexShrink={0}
-                                  />
-                                  <Text
-                                    size="sm"
-                                    color={MV.label}
-                                    css={{ wordBreak: "break-all" }}
-                                  >
-                                    {name}
-                                  </Text>
-                                </Box>
-                              )
-                            }}
-                          </For>
-                          <Show when={filteredSubDirs().length === 0}>
-                            <Text size="xs" color={MV.label3} px="$2" py="$2">
-                              No folders match
-                            </Text>
-                          </Show>
-                        </Box>
-                      </PopoverBody>
-                    </PopoverContent>
-                  </>
-                )}
-              </Popover>
-            </Show>
+                                  {name}
+                                </Text>
+                              </Box>
+                            )
+                          }}
+                        </For>
+                        <Show when={filteredSubDirs().length === 0}>
+                          <Text size="xs" color={MV.label3} px="$2" py="$2">
+                            No folders match
+                          </Text>
+                        </Show>
+                      </Box>
+                    </PopoverBody>
+                  </PopoverContent>
+                </>
+              )}
+            </Popover>
           </Show>
           <Show when={scanning()}>
             <Spinner size="sm" color={MV.accent} />
@@ -1982,24 +2086,27 @@ const MediaView = () => {
           </Tooltip>
         </Box>
 
-        {/* phones: search goes full-width on its own row, folders below */}
-        <Show when={containerWidth() < PHONE_W}>
-          <Box
-            display="flex"
-            alignItems="center"
-            gap="$2"
-            px="$3"
-            pb="$2"
-            flexWrap="wrap"
-          >
-            <InputGroup size="sm" w="100%" flexShrink={0}>
+        {/* phones: the expanded filter takes a full-width row of its own */}
+        <Show when={(searchOpen() || search()) && containerWidth() < PHONE_W}>
+          <Box px="$3" pb="$2">
+            <InputGroup size="sm" w="100%">
               <InputLeftElement pointerEvents="none">
                 <Box as={AiOutlineSearch} color={MV.label3} />
               </InputLeftElement>
               <Input
+                ref={searchInputRef}
                 placeholder="Filter files…"
                 value={search()}
                 onInput={(e) => setSearch(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    if (search()) setSearch("")
+                    else {
+                      setSearchOpen(false)
+                      e.currentTarget.blur()
+                    }
+                  }
+                }}
                 css={{
                   background: MV.surface,
                   borderColor: MV.hairline,
@@ -2007,114 +2114,25 @@ const MediaView = () => {
                   "&::placeholder": { color: MV.label3 },
                 }}
               />
+              <Show when={search()}>
+                <InputRightElement>
+                  <Box
+                    as="button"
+                    type="button"
+                    aria-label="Clear filter"
+                    color={MV.label3}
+                    cursor="pointer"
+                    background="none"
+                    border="none"
+                    padding={0}
+                    onClick={() => setSearch("")}
+                  >
+                    <Box as={BsX} />
+                  </Box>
+                </InputRightElement>
+              </Show>
             </InputGroup>
           </Box>
-          <Show when={subDirs().length > 0}>
-            <Box px="$3" pb="$2" flexShrink={0}>
-              <Popover placement="bottom-start">
-                {({ onClose }) => (
-                  <>
-                    <PopoverTrigger
-                      as={Button}
-                      variant="outline"
-                      size="sm"
-                      css={{
-                        background: MV.surface,
-                        borderColor: MV.hairline,
-                        color: MV.label,
-                      }}
-                    >
-                      <Box as={AiOutlineFolder} boxSize="14px" flexShrink={0} />
-                      Folders
-                      <Box
-                        as="span"
-                        css={{
-                          background: "rgba(0,0,0,0.05)",
-                          color: MV.label2,
-                          fontSize: "11px",
-                          fontWeight: "$medium",
-                          lineHeight: 1,
-                          padding: "3px 8px",
-                          borderRadius: "999px",
-                          marginLeft: "$1",
-                        }}
-                      >
-                        {subDirs().length}
-                      </Box>
-                    </PopoverTrigger>
-                    <PopoverContent
-                      w="280px"
-                      css={{
-                        background: MV.surface,
-                        border: `1px solid ${MV.hairline}`,
-                        boxShadow: MV.shadowPop,
-                        borderRadius: "14px",
-                      }}
-                    >
-                      <PopoverBody p="$1" display="flex" flexDirection="column">
-                        <Input
-                          placeholder="Filter folders…"
-                          value={dirFilter()}
-                          onInput={(e) => setDirFilter(e.currentTarget.value)}
-                          size="sm"
-                          mb="$1"
-                          css={{
-                            background: MV.surface,
-                            borderColor: MV.hairline,
-                            color: MV.label,
-                            "&::placeholder": { color: MV.label3 },
-                          }}
-                        />
-                        <Box maxH="50vh" overflowY="auto">
-                          <For each={filteredSubDirs()}>
-                            {(sub) => {
-                              const name = sub.split("/").pop() || sub
-                              return (
-                                <Box
-                                  display="flex"
-                                  alignItems="center"
-                                  gap="$2"
-                                  px="$2"
-                                  py="$1_5"
-                                  rounded="$md"
-                                  cursor="pointer"
-                                  _hover={{ bg: "rgba(0,0,0,0.04)" }}
-                                  onClick={() => {
-                                    onClose()
-                                    setDirFilter("")
-                                    scrollToFolder(sub)
-                                  }}
-                                >
-                                  <Box
-                                    as={AiOutlineFolder}
-                                    boxSize="14px"
-                                    color={MV.accent}
-                                    flexShrink={0}
-                                  />
-                                  <Text
-                                    size="sm"
-                                    color={MV.label}
-                                    css={{ wordBreak: "break-all" }}
-                                  >
-                                    {name}
-                                  </Text>
-                                </Box>
-                              )
-                            }}
-                          </For>
-                          <Show when={filteredSubDirs().length === 0}>
-                            <Text size="xs" color={MV.label3} px="$2" py="$2">
-                              No folders match
-                            </Text>
-                          </Show>
-                        </Box>
-                      </PopoverBody>
-                    </PopoverContent>
-                  </>
-                )}
-              </Popover>
-            </Box>
-          </Show>
         </Show>
       </Box>
 
@@ -2139,6 +2157,70 @@ const MediaView = () => {
               background: `linear-gradient(90deg, transparent, ${MV.accent}, transparent)`,
             }}
           />
+        </Box>
+      </Show>
+
+      {/* ═══════ Partial-scan warning ═══════ */}
+      {/* a scan that loaded some media and then failed on a nested folder
+          must not masquerade as a complete library */}
+      <Show when={scanError() && !scanning() && flatItems().length > 0}>
+        <Box
+          flexShrink={0}
+          display="flex"
+          alignItems="center"
+          gap="$2"
+          px="$3"
+          py="$1_5"
+          bg="rgba(255,149,0,0.10)"
+        >
+          <Box
+            as="span"
+            css={{
+              width: "7px",
+              height: "7px",
+              borderRadius: "50%",
+              background: "#FF9500",
+              flexShrink: 0,
+            }}
+          />
+          <Text size="xs" color="rgba(130,80,0,0.85)" flex={1}>
+            Some folders failed to load ({scanError()}) — the list may be
+            incomplete
+          </Text>
+          <Box
+            as="button"
+            type="button"
+            css={{
+              background: "none",
+              border: "none",
+              padding: 0,
+              fontSize: "12px",
+              color: "rgba(130,80,0,0.85)",
+              cursor: "pointer",
+              textDecoration: "underline",
+              flexShrink: 0,
+            }}
+            onClick={startScan}
+          >
+            Retry
+          </Box>
+          <Box
+            as="button"
+            type="button"
+            aria-label="Dismiss warning"
+            css={{
+              background: "none",
+              border: "none",
+              padding: 0,
+              color: "rgba(130,80,0,0.6)",
+              cursor: "pointer",
+              flexShrink: 0,
+              display: "flex",
+            }}
+            onClick={() => setScanError(null)}
+          >
+            <Box as={BsX} boxSize="14px" />
+          </Box>
         </Box>
       </Show>
 
@@ -2324,12 +2406,16 @@ const MediaView = () => {
                   />
                   <Text size="lg" color={MV.label2}>
                     {items().length === 0
-                      ? "No media files found"
+                      ? scanError()
+                        ? "Scan failed"
+                        : "No media files found"
                       : "No files match filter"}
                   </Text>
                   <Text size="sm" color={MV.label3} mt="$1">
                     {items().length === 0
-                      ? "Images, videos, GIFs and text files appear here"
+                      ? scanError()
+                        ? `${scanError()} — press ↻ to retry`
+                        : "Images, videos, GIFs and text files appear here"
                       : `Nothing matches “${search()}”`}
                   </Text>
                 </Box>
@@ -3746,8 +3832,12 @@ const MediaView = () => {
                       <For each={filmstripWindow()}>
                         {(i) => {
                           const it = flatItems()[i]
+                          // video without a server thumbnail shows its first
+                          // frame via a metadata-only <video> element
+                          const needsVideoFrame =
+                            it.type === "video" && !it.thumb
                           const src =
-                            it.type === "text"
+                            it.type === "text" || needsVideoFrame
                               ? ""
                               : it.thumb || getItemLink(it)
                           // class-driven active state: the attribute expression
@@ -3783,22 +3873,43 @@ const MediaView = () => {
                             <Show
                               when={src}
                               fallback={
-                                <Box
-                                  as="button"
-                                  type="button"
-                                  class={cellClass()}
-                                  data-fs-index={i}
-                                  aria-label={it.name}
-                                  onClick={jump}
-                                  onKeyDown={jumpKeys}
-                                  css={cellCss}
+                                <Show
+                                  when={needsVideoFrame}
+                                  fallback={
+                                    <Box
+                                      as="button"
+                                      type="button"
+                                      class={cellClass()}
+                                      data-fs-index={i}
+                                      aria-label={it.name}
+                                      onClick={jump}
+                                      onKeyDown={jumpKeys}
+                                      css={cellCss}
+                                    >
+                                      <Box
+                                        as={FiType}
+                                        boxSize="14px"
+                                        color={MV.dot.text}
+                                      />
+                                    </Box>
+                                  }
                                 >
                                   <Box
-                                    as={FiType}
-                                    boxSize="14px"
-                                    color={MV.dot.text}
+                                    as="video"
+                                    src={getItemLink(it) + "#t=0.1"}
+                                    preload="metadata"
+                                    muted
+                                    playsinline
+                                    tabIndex={0}
+                                    role="button"
+                                    data-fs-index={i}
+                                    aria-label={it.name}
+                                    onClick={jump}
+                                    onKeyDown={jumpKeys}
+                                    class={cellClass()}
+                                    css={cellCss}
                                   />
-                                </Box>
+                                </Show>
                               }
                             >
                               <Box
