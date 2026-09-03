@@ -988,8 +988,11 @@ const MediaView = () => {
     )
   }
 
-  const fetchFolder = async (path: string, signal: AbortSignal) => {
-    if (signal.aborted) return
+  const fetchFolder = async (
+    path: string,
+    signal: AbortSignal,
+  ): Promise<string[]> => {
+    if (signal.aborted) return []
     const isRoot = path === folderPath()
     setScanMsg(`Scanning: ${path}`)
 
@@ -1011,7 +1014,7 @@ const MediaView = () => {
       clearTimeout(timeoutId)
       signal.removeEventListener("abort", onScanAbort)
     }
-    if (signal.aborted) return
+    if (signal.aborted) return []
 
     let data: any
     handleRespWithoutNotify(
@@ -1026,7 +1029,7 @@ const MediaView = () => {
 
     if (!data?.content) {
       if (isRoot) setSubDirs([])
-      return
+      return []
     }
     const content = data.content as any[]
 
@@ -1034,7 +1037,7 @@ const MediaView = () => {
     const dirs: string[] = []
 
     for (const obj of content) {
-      if (signal.aborted) return
+      if (signal.aborted) return []
       if (obj.is_dir) {
         dirs.push(pathJoin(path, obj.name))
         continue
@@ -1063,12 +1066,55 @@ const MediaView = () => {
       scheduleScanFlush()
     }
 
-    // recursive descent — scan all subfolders so every media file under the
-    // path is shown (no depth limit)
-    for (const sub of dirs) {
-      if (signal.aborted) return
-      await fetchFolder(sub, signal)
+    return dirs
+  }
+
+  /* breadth-first parallel descent: six workers drain a shared queue.
+     Workers that find it empty WAIT while requests are still in flight
+     (a naive poll-once loop would let five workers exit before the first
+     response enqueues its subfolders, silently degrading to sequential).
+     A single folder failing is isolated — its siblings keep scanning. */
+  const scanAll = async (root: string, signal: AbortSignal) => {
+    const queue: string[] = [root]
+    let inFlight = 0
+    const waiters = new Set<() => void>()
+    const waitForWork = () =>
+      new Promise<void>((resolve) => waiters.add(resolve))
+    const wakeAll = () => {
+      const ws = [...waiters]
+      waiters.clear()
+      for (const w of ws) w()
     }
+    const worker = async () => {
+      while (!signal.aborted) {
+        const path = queue.shift()
+        if (path === undefined) {
+          if (inFlight === 0) return // drained: nothing queued, nothing flying
+          await waitForWork()
+          continue
+        }
+        inFlight++
+        try {
+          const dirs = await fetchFolder(path, signal)
+          queue.push(...dirs)
+        } catch (e) {
+          if (!signal.aborted) {
+            console.error("Media scan folder failed:", path, e)
+            setScanError(
+              e instanceof Error
+                ? e.message
+                : axios.isCancel(e)
+                  ? "timeout"
+                  : "",
+            )
+          }
+        } finally {
+          inFlight--
+          wakeAll()
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: 6 }, () => worker()))
   }
 
   const startScan = async () => {
@@ -1091,7 +1137,7 @@ const MediaView = () => {
     setFocusIndex(-1)
 
     try {
-      await fetchFolder(folderPath(), myCtrl.signal)
+      await scanAll(folderPath(), myCtrl.signal)
     } catch (e) {
       // only the owner reports: superseded scans abort by design
       if (abortCtrl === myCtrl && !myCtrl.signal.aborted) {
@@ -1806,13 +1852,6 @@ const MediaView = () => {
                       <div class="mv-card-play" />
                     </Show>
                   </Show>
-                  <div class="mv-card-badge">
-                    <span
-                      class="mv-card-dot"
-                      style={{ background: MV.dot[item.type] }}
-                    />
-                    {item.type}
-                  </div>
                 </div>
                 <div class="mv-card-cap">
                   <div class="mv-card-name">{item.name}</div>
@@ -2329,26 +2368,6 @@ const MediaView = () => {
           filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
           pointer-events: none;
         }
-        .mv-card-badge {
-          position: absolute;
-          top: 4px;
-          right: 4px;
-          display: flex;
-          align-items: center;
-          gap: 5px;
-          padding: 4px 7px;
-          border-radius: 999px;
-          background: rgba(255, 255, 255, 0.85);
-          border: 1px solid rgba(0, 0, 0, 0.08);
-          font-size: 10px;
-          font-weight: 600;
-          line-height: 1;
-          letter-spacing: 0.05em;
-          text-transform: uppercase;
-          color: rgba(60, 60, 67, 0.58);
-          pointer-events: none;
-        }
-        .mv-card-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
         .mv-card-cap { padding: 10px 12px 12px; }
         .mv-card-name {
           font-size: 12px;
@@ -3565,12 +3584,14 @@ const MediaView = () => {
                       return
                     }
                     if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) {
-                      // horizontal swipe → browse (left=prev, right=next). On video,
-                      // ignore swipes that start on the bottom control bar so the
-                      // native seek bar can be dragged instead.
+                      // horizontal swipe: left = next, right = EXIT (iOS back
+                      // semantics — paging backwards is what the ← button and
+                      // arrow key are for). On video, ignore swipes that start
+                      // on the bottom control bar so the native seek bar can
+                      // be dragged instead.
                       if (item()?.type === "video" && startedOnVideoControls())
                         return
-                      if (dx > 0) lightboxPrev()
+                      if (dx > 0) closeLightbox()
                       else lightboxNext()
                     } else if (
                       Math.abs(dy) > 50 &&
@@ -3658,8 +3679,8 @@ const MediaView = () => {
                     )}
                   </For>
                 </Box>
-                {/* top overlay — frosted bar with type badge, filename, download
-                  and close (click-through) */}
+                {/* top overlay — frosted bar: filename + meta on the left,
+                  quiet round buttons on the right (click-through) */}
                 <Box
                   class={`mv-chrome mv-chrome-top${chromeHidden() ? " mv-chrome-off" : ""}${motionActive() ? " mv-glass-off" : ""}`}
                   pos="absolute"
@@ -3682,52 +3703,34 @@ const MediaView = () => {
                     px="$3"
                     py="$2_5"
                   >
-                    <Show when={item()}>
-                      <Box
-                        as="span"
-                        flexShrink={0}
+                    <Box flex={1} overflow="hidden" minW="0">
+                      <Text
+                        size="sm"
+                        color={MV.label}
+                        fontWeight="$semibold"
                         css={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: "6px",
-                          background: "rgba(0,0,0,0.05)",
-                          border: `1px solid ${MV.hairline}`,
-                          borderRadius: "999px",
-                          padding: "3px 9px",
-                          fontSize: "10px",
-                          fontWeight: 600,
-                          letterSpacing: "0.05em",
-                          textTransform: "uppercase",
-                          color: MV.label2,
-                          lineHeight: 1,
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
                         }}
                       >
-                        <Box
-                          as="span"
-                          css={{
-                            width: "6px",
-                            height: "6px",
-                            borderRadius: "50%",
-                            background: MV.dot[item()!.type],
-                            flexShrink: 0,
-                          }}
-                        />
-                        {item()!.type}
-                      </Box>
-                    </Show>
-                    <Text
-                      flex={1}
-                      size="sm"
-                      color={MV.label}
-                      fontWeight="$semibold"
-                      css={{
-                        whiteSpace: "nowrap",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                      }}
-                    >
-                      {item()?.name}
-                    </Text>
+                        {item()?.name}
+                      </Text>
+                      <Text
+                        size="xs"
+                        color={MV.label3}
+                        css={{
+                          whiteSpace: "nowrap",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          fontVariantNumeric: "tabular-nums",
+                        }}
+                      >
+                        {item()
+                          ? `${formatSize(item()!.size)}${formatDate(item()!.modified) ? " · " + formatDate(item()!.modified) : ""}`
+                          : ""}
+                      </Text>
+                    </Box>
                     <Tooltip label="Feed mode (vertical)" placement="bottom">
                       <IconButton
                         aria-label="Feed mode"
