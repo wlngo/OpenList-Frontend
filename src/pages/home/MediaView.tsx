@@ -1792,11 +1792,12 @@ const MediaView = () => {
         flexShrink={0}
         zIndex={10}
         bg={MV.glass}
-        borderBottom={`1px solid ${MV.hairline}`}
         css={{
           backdropFilter: MV.glassBlur,
           WebkitBackdropFilter: MV.glassBlur,
-          boxShadow: "0 1px 2px rgba(0,0,0,0.03)",
+          // no hard hairline — the frosted glass plus this soft edge shadow
+          // separates the bar as content scrolls under it
+          boxShadow: "0 1px 3px rgba(0,0,0,0.05)",
         }}
       >
         <Box display="flex" alignItems="center" gap="$2" px="$3" py="$2">
@@ -1834,18 +1835,6 @@ const MediaView = () => {
             </Text>
           </Box>
           <Show when={containerWidth() >= PHONE_W}>
-            <Text
-              size="xs"
-              color={MV.label2}
-              flexShrink={0}
-              css={{ fontVariantNumeric: "tabular-nums" }}
-            >
-              {flatItems().length} items
-              <Show when={subDirs().length > 0}>
-                {" · "}
-                {subDirs().length} folders
-              </Show>
-            </Text>
             <InputGroup size="sm" w="200px" flexShrink={0}>
               <InputLeftElement pointerEvents="none">
                 <Box as={AiOutlineSearch} color={MV.label3} />
@@ -2019,18 +2008,6 @@ const MediaView = () => {
                 }}
               />
             </InputGroup>
-            <Text
-              size="xs"
-              color={MV.label2}
-              flexShrink={0}
-              css={{ fontVariantNumeric: "tabular-nums" }}
-            >
-              {flatItems().length} items
-              <Show when={subDirs().length > 0}>
-                {" · "}
-                {subDirs().length} folders
-              </Show>
-            </Text>
           </Box>
           <Show when={subDirs().length > 0}>
             <Box px="$3" pb="$2" flexShrink={0}>
