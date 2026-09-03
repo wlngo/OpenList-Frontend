@@ -3679,8 +3679,8 @@ const MediaView = () => {
                     )}
                   </For>
                 </Box>
-                {/* top overlay — frosted bar: filename + meta on the left,
-                  quiet round buttons on the right (click-through) */}
+                {/* top overlay — slim frosted strip: one line of name+meta,
+                  quiet 28px buttons that only reveal on hover */}
                 <Box
                   class={`mv-chrome mv-chrome-top${chromeHidden() ? " mv-chrome-off" : ""}${motionActive() ? " mv-glass-off" : ""}`}
                   pos="absolute"
@@ -3699,51 +3699,49 @@ const MediaView = () => {
                   <Box
                     display="flex"
                     alignItems="center"
-                    gap="$2"
+                    gap="$1_5"
                     px="$3"
-                    py="$2_5"
+                    py="$1_5"
                   >
-                    <Box flex={1} overflow="hidden" minW="0">
-                      <Text
-                        size="sm"
-                        color={MV.label}
-                        fontWeight="$semibold"
-                        css={{
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                        }}
-                      >
-                        {item()?.name}
-                      </Text>
-                      <Text
-                        size="xs"
-                        color={MV.label3}
-                        css={{
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                          textOverflow: "ellipsis",
-                          fontVariantNumeric: "tabular-nums",
-                        }}
-                      >
-                        {item()
-                          ? `${formatSize(item()!.size)}${formatDate(item()!.modified) ? " · " + formatDate(item()!.modified) : ""}`
-                          : ""}
-                      </Text>
-                    </Box>
+                    <Text
+                      flex={1}
+                      size="sm"
+                      color={MV.label}
+                      fontWeight="$medium"
+                      minW="0"
+                      css={{
+                        whiteSpace: "nowrap",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        fontVariantNumeric: "tabular-nums",
+                      }}
+                    >
+                      {item()?.name}
+                      <Show when={item()}>
+                        <Box
+                          as="span"
+                          color={MV.label3}
+                          fontSize="12px"
+                          fontWeight="$normal"
+                        >
+                          {`  ${formatSize(item()!.size)}${formatDate(item()!.modified) ? " · " + formatDate(item()!.modified) : ""}`}
+                        </Box>
+                      </Show>
+                    </Text>
                     <Tooltip label="Feed mode (vertical)" placement="bottom">
                       <IconButton
                         aria-label="Feed mode"
                         icon={<FiFilm />}
                         variant="ghost"
+                        size="sm"
                         flexShrink={0}
-                        w="32px"
-                        h="32px"
+                        w="28px"
+                        h="28px"
                         rounded="$full"
-                        color={MV.label}
+                        color={MV.label2}
                         css={{
-                          background: "rgba(0,0,0,0.05)",
-                          "&:hover": { background: "rgba(0,0,0,0.10)" },
+                          background: "transparent",
+                          "&:hover": { background: "rgba(0,0,0,0.08)" },
                         }}
                         onClick={enterFeed}
                       />
@@ -3757,35 +3755,38 @@ const MediaView = () => {
                         rel="noopener"
                         aria-label="Download"
                         flexShrink={0}
-                        w="32px"
-                        h="32px"
+                        w="28px"
+                        h="28px"
                         display="flex"
                         alignItems="center"
                         justifyContent="center"
                         rounded="$full"
-                        color={MV.label}
+                        color={MV.label2}
                         css={{
                           pointerEvents: "auto",
-                          background: "rgba(0,0,0,0.05)",
-                          "&:hover": { background: "rgba(0,0,0,0.10)" },
+                          background: "transparent",
+                          "&:hover": { background: "rgba(0,0,0,0.08)" },
                         }}
                         onClick={(e: MouseEvent) => e.stopPropagation()}
                       >
-                        <Box as={BsDownload} boxSize="15px" />
+                        <Box as={BsDownload} boxSize="14px" />
                       </Box>
                     </Show>
                     <IconButton
                       aria-label="Close"
                       icon={<BsX />}
                       variant="ghost"
-                      color={MV.label}
-                      size="lg"
+                      size="sm"
+                      flexShrink={0}
+                      w="28px"
+                      h="28px"
                       rounded="$full"
+                      color={MV.label2}
                       onClick={closeLightbox}
                       css={{
                         pointerEvents: "auto",
-                        background: "rgba(0,0,0,0.05)",
-                        "&:hover": { background: "rgba(0,0,0,0.10)" },
+                        background: "transparent",
+                        "&:hover": { background: "rgba(0,0,0,0.08)" },
                       }}
                     />
                   </Box>
