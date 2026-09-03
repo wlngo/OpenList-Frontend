@@ -31,6 +31,7 @@ import {
   BsChevronLeft,
   BsChevronRight,
   BsQuestionCircle,
+  BsDownload,
 } from "solid-icons/bs"
 import {
   AiOutlineSearch,
@@ -152,6 +153,10 @@ const PHONE_W = 640 // below: phone layout (full-width search, swipe-only lightb
 // fine pointer (mouse/trackpad) → keyboard hints make sense
 const FINE_POINTER =
   typeof matchMedia !== "undefined" && matchMedia("(pointer: fine)").matches
+// user asked the OS to calm motion down — all decorative animation is skipped
+const REDUCED_MOTION =
+  typeof matchMedia !== "undefined" &&
+  matchMedia("(prefers-reduced-motion: reduce)").matches
 
 /* minimum card width tiers: phone / tablet / desktop */
 const minCardW = (w: number) => (w < 480 ? 130 : w < 900 ? 160 : MIN_CARD_W)
@@ -177,6 +182,10 @@ const MV = {
   shadowCard: "0 1px 2px rgba(0,0,0,0.04), 0 4px 14px rgba(0,0,0,0.05)",
   shadowCardHover: "0 2px 6px rgba(0,0,0,0.05), 0 12px 30px rgba(0,0,0,0.10)",
   shadowPop: "0 2px 8px rgba(0,0,0,0.06), 0 16px 48px rgba(0,0,0,0.16)",
+  // lightbox stage — a whisper of depth instead of flat paper
+  stageGrad:
+    "radial-gradient(120% 90% at 50% 38%, #FBFBFD 0%, #F4F4F7 55%, #EAEAEF 100%)",
+  shadowStage: "0 6px 32px rgba(0,0,0,0.14), 0 1px 4px rgba(0,0,0,0.06)",
 }
 
 const getMediaType = (name: string): MediaItem["type"] | null => {
@@ -196,6 +205,8 @@ const formatSize = (bytes: number): string => {
     return (bytes / (1024 * 1024)).toFixed(1) + " MB"
   return (bytes / (1024 * 1024 * 1024)).toFixed(1) + " GB"
 }
+
+const formatDate = (iso: string): string => (iso ? iso.slice(0, 10) : "")
 
 /* ──────────────────── Component ──────────────────── */
 
@@ -257,6 +268,36 @@ const MediaView = () => {
   let touchStartY = 0
   let touchMoved = false
   let touchStartTarget: HTMLElement | null = null
+  // two-finger pinch (zoom) / single-finger drag (pan while zoomed) tracking
+  let multiTouch = false // latched until ALL fingers are up, so the tail of a
+  // pinch can never be misread as a swipe/tap
+  let pinchFingers = 0
+  let pinchStart: {
+    d: number
+    z: number
+    pan: { x: number; y: number }
+    mx: number
+    my: number
+    cx: number // media center (un-zoomed) in client coords, for focal anchoring
+    cy: number
+  } | null = null
+  let touchPanBase: {
+    x: number
+    y: number
+    px: number
+    py: number
+  } | null = null
+  // touch tap timing — double-tap zoom + delayed single-tap close. The close
+  // delay must exceed the double-tap window so the second tap can always
+  // cancel it; the timer is scoped to the current slide and cleared on every
+  // open/close/turn so a stray close can never land on a new item.
+  const TAP_WINDOW_MS = 300
+  const TAP_CLOSE_MS = 360
+  let lastTapAt = 0
+  let lastTapPt = { x: 0, y: 0 }
+  let tapTimer: ReturnType<typeof setTimeout> | undefined
+  let lastTouchAt = 0
+  let lastTouchClickPt = { x: 0, y: 0 }
   let outTimer: ReturnType<typeof setTimeout> | undefined
   let scanItems: MediaItem[] = []
   let scanFlushPending = false
@@ -336,6 +377,263 @@ const MediaView = () => {
   const currentItem = createMemo(() => {
     const idx = lightboxIndex()
     return idx !== null ? flatItems()[idx] : null
+  })
+
+  /* ─── Lightbox zoom & pan (still images only) ───
+     Wheel / trackpad-pinch zooms toward the cursor, double-click toggles
+     1×↔2.5× at the clicked point, and a zoomed image can be dragged around.
+     transform = translate(pan)·scale(zoom) around the media's center. */
+  const [zoom, setZoom] = createSignal(1)
+  const [pan, setPan] = createSignal({ x: 0, y: 0 })
+  const [panning, setPanning] = createSignal(false)
+  // true while a touch pinch / zoomed drag is in flight (mouse drags use
+  // `panning`; touch gestures bypass the pointer path)
+  const [touchGesture, setTouchGesture] = createSignal(false)
+  // true for the duration of a lightbox page-turn slide — covers video
+  // slides too, which intentionally carry no outgoing snapshot
+  const [sliding, setSliding] = createSignal(false)
+  // transition duration (s) applied to the transform while a programmatic
+  // zoom plays; false while dragging so the image tracks the pointer 1:1
+  const [zoomAnim, setZoomAnim] = createSignal<number | false>(false)
+  let zoomAnimTimer: ReturnType<typeof setTimeout> | undefined
+  let mediaEl: HTMLDivElement | undefined
+  let dragPid = -1
+  // removes the window-level drag fallback (set when setPointerCapture
+  // failed); hoisted here so resetZoom can tear it down if the lightbox
+  // closes mid-drag
+  let dragWinCleanup: (() => void) | null = null
+  let panStartPt = { x: 0, y: 0 }
+  let panStartVal = { x: 0, y: 0 }
+
+  const canZoom = () => {
+    const it = currentItem()
+    return it !== null && (it.type === "image" || it.type === "gif")
+  }
+  const zoomScale = () => zoom()
+
+  // media base size (measured lazily: on mount, at gesture start, and only
+  // again if the viewport changed since) — reading offsetWidth on every
+  // pointer event would churn layout, and the size cannot change while a
+  // gesture is in flight
+  let mediaBaseSize = { w: 0, h: 0 }
+  let mediaBaseVp = { w: 0, h: 0 }
+  const measureMedia = () => {
+    if (mediaEl) {
+      mediaBaseSize = { w: mediaEl.offsetWidth, h: mediaEl.offsetHeight }
+      mediaBaseVp = { w: window.innerWidth, h: window.innerHeight }
+    }
+  }
+  const measureMediaIfStale = () => {
+    if (
+      mediaBaseVp.w !== window.innerWidth ||
+      mediaBaseVp.h !== window.innerHeight ||
+      !mediaBaseSize.w
+    )
+      measureMedia()
+  }
+
+  // keep the dragged image roughly over the stage: the pan never exceeds half
+  // the extra size the zoom created
+  const clampPan = (x: number, y: number, z: number) => {
+    const w = mediaBaseSize.w || window.innerWidth
+    const h = mediaBaseSize.h || window.innerHeight
+    const maxX = Math.max(0, (w * z - w) / 2)
+    const maxY = Math.max(0, (h * z - h) / 2)
+    return {
+      x: Math.max(-maxX, Math.min(maxX, x)),
+      y: Math.max(-maxY, Math.min(maxY, y)),
+    }
+  }
+
+  // coalesce high-frequency pan/zoom writes (pointermove / touchmove) into
+  // one signal update per frame — pan and zoom land in the SAME frame so the
+  // two never disagree visually
+  let panRafId = 0
+  let panRafVal: { x: number; y: number } | null = null
+  let zoomRafVal = -1
+  const scheduleSetPan = (p: { x: number; y: number }, z?: number) => {
+    panRafVal = p
+    if (z !== undefined) zoomRafVal = z
+    if (!panRafId) {
+      panRafId = requestAnimationFrame(() => {
+        panRafId = 0
+        if (panRafVal) {
+          if (zoomRafVal > 0) setZoom(zoomRafVal)
+          setPan(panRafVal)
+        }
+        // committed — clear so a later flush can't replay this frame and a
+        // pan-only schedule can't inherit a stale zoom payload
+        panRafVal = null
+        zoomRafVal = -1
+      })
+    }
+  }
+  const cancelPanRaf = () => {
+    cancelAnimationFrame(panRafId)
+    panRafId = 0
+    panRafVal = null
+    zoomRafVal = -1
+  }
+  // apply any pending rAF pan/zoom write right now — needed when deciding
+  // based on the just-scheduled state (e.g. the snap-home check at gesture
+  // end must see the final pinch zoom, not the previous frame's)
+  const flushPanRaf = () => {
+    if (panRafId) {
+      cancelAnimationFrame(panRafId)
+      panRafId = 0
+    }
+    if (panRafVal) {
+      if (zoomRafVal > 0) setZoom(zoomRafVal)
+      setPan(panRafVal)
+      panRafVal = null
+      zoomRafVal = -1
+    }
+  }
+
+  const applyZoom = (
+    target: number,
+    cx: number,
+    cy: number,
+    dur: number | false,
+  ) => {
+    const z0 = zoom()
+    const z1 = Math.max(1, Math.min(8, target))
+    if (z1 === z0) return
+    // keep the point under the cursor stationary:
+    // pan' = c − (c − pan)·(z1/z0)
+    const p0 = pan()
+    const p1 =
+      z1 === 1
+        ? { x: 0, y: 0 }
+        : {
+            x: cx - (cx - p0.x) * (z1 / z0),
+            y: cy - (cy - p0.y) * (z1 / z0),
+          }
+    cancelPanRaf()
+    clearTimeout(zoomAnimTimer)
+    setZoomAnim(dur !== false && !REDUCED_MOTION ? dur : false)
+    setZoom(z1)
+    setPan(clampPan(p1.x, p1.y, z1))
+    if (dur !== false && !REDUCED_MOTION)
+      zoomAnimTimer = setTimeout(() => setZoomAnim(false), dur * 1000 + 40)
+  }
+
+  // a gesture ending just above 1× snaps home — avoids an awkward hairline
+  // zoom the user can't meaningfully pan. Flushes the pending frame first so
+  // the decision sees the gesture's final zoom, not the previous frame's.
+  const snapZoomHome = () => {
+    flushPanRaf()
+    const z = zoomScale()
+    if (z > 1 && z < 1.05) resetZoom(0.25)
+  }
+  let wheelSnapTimer: ReturnType<typeof setTimeout> | undefined
+
+  const resetZoom = (dur: number | false = 0.32) => {
+    cancelPanRaf()
+    clearTimeout(zoomAnimTimer)
+    dragPid = -1
+    setPanning(false)
+    setTouchGesture(false)
+    dragWinCleanup?.()
+    dragWinCleanup = null
+    if (dur === false || REDUCED_MOTION) {
+      setZoomAnim(false)
+      setZoom(1)
+      setPan({ x: 0, y: 0 })
+      return
+    }
+    setZoomAnim(dur)
+    setZoom(1)
+    setPan({ x: 0, y: 0 })
+    zoomAnimTimer = setTimeout(() => setZoomAnim(false), dur * 1000 + 40)
+  }
+
+  /* ─── Lightbox chrome auto-hide (fine pointers only) ───
+     macOS Photos behaviour: after a moment of stillness the bars melt away
+     so the media owns the screen; any movement brings them back. Touch
+     devices keep the bars — a tap there means "close", not "show chrome". */
+  const [chromeHidden, setChromeHidden] = createSignal(false)
+  let chromeTimer: ReturnType<typeof setTimeout> | undefined
+  let chromeArmAt = 0
+  // true while something is actively transforming on screen (slide / zoom /
+  // pan, mouse or touch): the glass bars drop their backdrop-filter for the
+  // duration — re-blurring live content every frame is the most expensive
+  // thing the compositor does here, and a hairline-solid bar is
+  // indistinguishable mid-motion
+  const motionActive = createMemo(
+    () =>
+      panning() ||
+      touchGesture() ||
+      sliding() ||
+      zoomAnim() !== false ||
+      outgoing() !== null,
+  )
+  // `arm`: finger movement wakes the bars but never arms the hide timer — on
+  // touch the bars stay put (a tap there means "close", not "show chrome");
+  // on hybrid devices whichever input was used last decides. Re-arming is
+  // throttled: high-Hz pointer streams would otherwise churn timers all day.
+  const wakeChrome = (arm = true) => {
+    if (lightboxIndex() === null) return
+    setChromeHidden(false)
+    if (FINE_POINTER && arm) {
+      const now = Date.now()
+      // re-arm at most every 150ms; the handle must be nulled whenever the
+      // timer is cleared or fires, or a stale truthy handle inside the
+      // window would skip re-arming and never hide the chrome again
+      if (chromeTimer === undefined || now - chromeArmAt > 150) {
+        chromeArmAt = now
+        if (chromeTimer !== undefined) clearTimeout(chromeTimer)
+        chromeTimer = undefined
+        chromeTimer = setTimeout(() => {
+          chromeTimer = undefined
+          if (lightboxIndex() !== null) setChromeHidden(true)
+        }, 2600)
+      }
+    } else if (chromeTimer !== undefined) {
+      clearTimeout(chromeTimer)
+      chromeTimer = undefined
+    }
+  }
+
+  // a viewport resize or rotation while zoomed shrinks the rendered media —
+  // re-measure and pull the pan back inside the new bounds instead of
+  // leaving the image stranded off-stage until the next gesture
+  let resizeClampTimer: ReturnType<typeof setTimeout> | undefined
+  const onViewportResize = () => {
+    if (lightboxIndex() === null) return
+    clearTimeout(resizeClampTimer)
+    resizeClampTimer = setTimeout(() => {
+      // consume any frame queued under the old dimensions first — otherwise
+      // it would fire after the clamp and overwrite the corrected pan
+      flushPanRaf()
+      measureMedia()
+      if (zoomScale() > 1) setPan(clampPan(pan().x, pan().y, zoomScale()))
+    }, 120)
+  }
+
+  /* ─── Filmstrip: windowed thumbnails around the current index ─── */
+  const filmstripWindow = createMemo(() => {
+    const i = lightboxIndex()
+    const len = flatItems().length
+    if (i === null || len < 2) return []
+    const R = 12
+    const out: number[] = []
+    for (let k = Math.max(0, i - R); k <= Math.min(len - 1, i + R); k++)
+      out.push(k)
+    return out
+  })
+  let stripRef: HTMLDivElement | undefined
+  createEffect(() => {
+    const i = lightboxIndex()
+    if (i === null || !stripRef) return
+    queueMicrotask(() => {
+      // instant, not smooth: an animated strip scroll is a repaint under the
+      // glass bar on every single flip
+      stripRef?.querySelector(`[data-fs-index="${i}"]`)?.scrollIntoView({
+        inline: "center",
+        block: "nearest",
+      })
+    })
   })
 
   /* ─── Virtualized rows: flatten groups into Header / CardRow / TextRow ─── */
@@ -471,6 +769,17 @@ const MediaView = () => {
         })
       : undefined
 
+  /* the entrance cascade runs during the scan plus a 1s grace after loading
+     ends (setLoading(false) and setScanning(false) land in the same turn, so
+     a scan-only gate would strip mv-enter before the first rows ever paint).
+     Everything mounted later — scrolling, filtering — never animates: the
+     virtualizer remounts rows as you scroll, and repaint-on-mount during
+     scroll is exactly the jank we don't want. No seen-keys bookkeeping: the
+     virtualizer re-creates row subtrees on its first measure, which would
+     strip the class mid-cascade; replays inside the 1s window are harmless. */
+  let entranceAfterLoad = 0
+  const entranceActive = () => scanning() || Date.now() < entranceAfterLoad
+
   const recomputeCols = () => {
     const w = scrollRef?.clientWidth ?? 0
     if (w > 0) {
@@ -588,6 +897,10 @@ const MediaView = () => {
       clearTimeout(scanFlushTimer)
       scanFlushPending = false
       setItems(scanItems.slice())
+      // stamp the entrance deadline BEFORE the loading flip: Solid settles
+      // reactive updates synchronously, so the row classes must not be able
+      // to evaluate against a stale deadline
+      entranceAfterLoad = Date.now() + 1000
       setLoading(false)
       setScanning(false)
       setScanMsg("")
@@ -692,8 +1005,12 @@ const MediaView = () => {
 
   const openLightbox = (index: number) => {
     clearTimeout(outTimer)
+    clearTimeout(tapTimer) // a pending tap-close belongs to the previous slide
+    clearTimeout(wheelSnapTimer)
+    lastTapAt = 0 // …and so does any half-finished double-tap
     setOutgoing(null)
     setNavDir("open")
+    resetZoom(false)
     setLightboxIndex(index)
     setFocusIndex(index)
     const item = flatItems()[index]
@@ -703,7 +1020,14 @@ const MediaView = () => {
 
   const closeLightbox = () => {
     clearTimeout(outTimer)
+    clearTimeout(tapTimer)
+    clearTimeout(wheelSnapTimer)
+    lastTapAt = 0
     setOutgoing(null)
+    // closing mid-slide must not strand the slide signal (its timer was just
+    // cancelled) — the glass bars would stay solid after the next open
+    setSliding(false)
+    resetZoom(false)
     // sync the grid once on exit instead of on every flip — scrolling the
     // hidden grid per page turn mounted rows and churned the virtualizer,
     // which made flipping janky
@@ -712,45 +1036,45 @@ const MediaView = () => {
     setLightboxIndex(null)
   }
 
+  // one entry point for every way of turning pages (keys, arrows, swipe,
+  // filmstrip) — sets the slide direction and the outgoing snapshot
+  const gotoLightbox = (ni: number) => {
+    const idx = lightboxIndex()
+    if (idx === null || ni === idx) return
+    const cur = flatItems()[idx]
+    const dir = ni < idx ? "prev" : "next"
+    clearTimeout(tapTimer) // never close a slide the user just turned to
+    clearTimeout(wheelSnapTimer)
+    lastTapAt = 0 // the new slide starts with a clean tap slate
+    // snapshot the item being left so it can slide out while the new one
+    // slides in (dual-layer vertical page-turn, TikTok-style).
+    // the outgoing snapshot only pays off for stills — a second mounted
+    // video doubles decode cost during the slide for no visual gain
+    setOutgoing(cur && cur.type !== "video" ? { item: cur, dir } : null)
+    setNavDir(dir)
+    setSliding(true)
+    resetZoom(false)
+    setLightboxIndex(ni)
+    setFocusIndex(ni)
+    clearTimeout(outTimer)
+    outTimer = setTimeout(() => {
+      setOutgoing(null)
+      setSliding(false)
+    }, 360)
+    const item = flatItems()[ni]
+    if (item?.type === "text") fetchTextContent(item)
+    preloadAdjacent(ni)
+  }
+
   const lightboxPrev = () => {
     const idx = lightboxIndex()
-    if (idx !== null && idx > 0) {
-      const cur = flatItems()[idx]
-      const ni = idx - 1
-      // snapshot the item being left so it can slide out while the new one
-      // slides in (dual-layer vertical page-turn, TikTok-style).
-      // the outgoing snapshot only pays off for stills — a second mounted
-      // video doubles decode cost during the slide for no visual gain
-      setOutgoing(
-        cur && cur.type !== "video" ? { item: cur, dir: "prev" } : null,
-      )
-      setNavDir("prev")
-      setLightboxIndex(ni)
-      clearTimeout(outTimer)
-      outTimer = setTimeout(() => setOutgoing(null), 360)
-      const item = flatItems()[ni]
-      if (item?.type === "text") fetchTextContent(item)
-      preloadAdjacent(ni)
-    }
+    if (idx !== null && idx > 0) gotoLightbox(idx - 1)
   }
 
   const lightboxNext = () => {
     const idx = lightboxIndex()
     const len = flatItems().length
-    if (idx !== null && idx < len - 1) {
-      const cur = flatItems()[idx]
-      const ni = idx + 1
-      setOutgoing(
-        cur && cur.type !== "video" ? { item: cur, dir: "next" } : null,
-      )
-      setNavDir("next")
-      setLightboxIndex(ni)
-      clearTimeout(outTimer)
-      outTimer = setTimeout(() => setOutgoing(null), 360)
-      const item = flatItems()[ni]
-      if (item?.type === "text") fetchTextContent(item)
-      preloadAdjacent(ni)
-    }
+    if (idx !== null && idx < len - 1) gotoLightbox(idx + 1)
   }
 
   /* ─── Jump ─── */
@@ -779,6 +1103,7 @@ const MediaView = () => {
     const lb = lightboxIndex()
 
     if (lb !== null) {
+      wakeChrome()
       switch (e.key) {
         case "ArrowLeft":
         case "h":
@@ -795,6 +1120,20 @@ const MediaView = () => {
         case "Escape":
           e.preventDefault()
           closeLightbox()
+          return
+        case "+":
+        case "=":
+        case "-":
+        case "_":
+        case "0":
+          // leave Ctrl/Cmd +/- (browser zoom) and friends alone
+          if (e.ctrlKey || e.metaKey || e.altKey) return
+          if (!canZoom()) return
+          e.preventDefault()
+          if (e.key === "0") resetZoom()
+          else if (e.key === "-" || e.key === "_")
+            applyZoom(zoomScale() / 1.5, 0, 0, 0.28)
+          else applyZoom(zoomScale() * 1.5, 0, 0, 0.28)
           return
       }
       return
@@ -907,8 +1246,41 @@ const MediaView = () => {
     folderPath()
     startScan()
   })
+  // lightbox chrome: wake on open, hide after idle (fine pointers only).
+  // The most recent input modality decides whether the hide timer is armed —
+  // a touch-opened lightbox on a hybrid device keeps its bars until a mouse
+  // is actually used. Tracked at component level (onMount) so the very
+  // pointerdown that opens the lightbox is already recorded when the effect
+  // below first reads it.
+  let lastInputTouch = false
+  const trackModality = (e: PointerEvent) => {
+    lastInputTouch = e.pointerType === "touch"
+  }
+  createEffect(() => {
+    if (lightboxIndex() === null) {
+      clearTimeout(chromeTimer)
+      chromeTimer = undefined
+      setChromeHidden(false)
+      return
+    }
+    wakeChrome(!lastInputTouch)
+    const wake = (e: PointerEvent) => {
+      trackModality(e)
+      wakeChrome(!lastInputTouch)
+    }
+    window.addEventListener("pointermove", wake, { passive: true })
+    window.addEventListener("pointerdown", wake, { passive: true })
+    onCleanup(() => {
+      window.removeEventListener("pointermove", wake)
+      window.removeEventListener("pointerdown", wake)
+      clearTimeout(chromeTimer)
+      chromeTimer = undefined
+    })
+  })
   onMount(() => {
     window.addEventListener("keydown", onKeyDown)
+    window.addEventListener("pointerdown", trackModality, { passive: true })
+    window.addEventListener("resize", onViewportResize, { passive: true })
     recomputeCols()
     if (scrollRef) {
       resizeObserver = new ResizeObserver(() => recomputeCols())
@@ -917,12 +1289,23 @@ const MediaView = () => {
   })
   onCleanup(() => {
     window.removeEventListener("keydown", onKeyDown)
+    window.removeEventListener("pointerdown", trackModality)
+    window.removeEventListener("resize", onViewportResize)
+    clearTimeout(resizeClampTimer)
     abortCtrl?.abort()
     textObserver?.disconnect()
     resizeObserver?.disconnect()
     rowResizeObserver?.disconnect()
     clearTimeout(outTimer)
     clearTimeout(scanFlushTimer)
+    clearTimeout(chromeTimer)
+    chromeTimer = undefined
+    clearTimeout(zoomAnimTimer)
+    clearTimeout(tapTimer)
+    clearTimeout(wheelSnapTimer)
+    cancelAnimationFrame(panRafId)
+    dragWinCleanup?.()
+    dragWinCleanup = null
   })
 
   /* ─── Helpers ─── */
@@ -1111,147 +1494,56 @@ const MediaView = () => {
             const idx = () => getIndex(item)
             const focused = () => focusIndex() === idx()
             const link = () => getItemLink(item)
+            // a broken thumbnail swaps to a static type-icon placeholder
+            // instead of an empty gray tile
+            const [thumbErr, setThumbErr] = createSignal(false)
             const thumbUrl = () => {
               if (item.type === "gif") return link()
               if (item.type === "image") return item.thumb || link()
               if (item.type === "video") return item.thumb
               return ""
             }
+            // plain DOM + precompiled classes — see .mv-card styles above
             return (
-              <Box
+              <div
                 data-media-card={idx().toString()}
-                rounded="$xl"
-                overflow="hidden"
-                cursor="pointer"
-                border="1px solid"
-                borderColor={focused() ? "rgba(0,122,255,0.45)" : MV.hairline}
-                bg={MV.surface}
-                transition="transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease"
-                boxShadow={
-                  focused()
-                    ? `0 0 0 3px rgba(0,122,255,0.25), ${MV.shadowCard}`
-                    : MV.shadowCard
-                }
-                _hover={{
-                  transform: "translateY(-2px)",
-                  boxShadow: MV.shadowCardHover,
-                  borderColor: "rgba(0,0,0,0.12)",
-                }}
+                class={focused() ? "mv-card mv-card-focus" : "mv-card"}
                 onClick={() => openLightbox(idx())}
               >
-                <Box
-                  bg="rgba(0,0,0,0.03)"
-                  pos="relative"
-                  overflow="hidden"
-                  css={{ aspectRatio: "4 / 3" }}
-                >
+                <div class="mv-card-media">
                   <Show
-                    when={thumbUrl()}
+                    when={thumbUrl() && !thumbErr()}
                     fallback={
                       <Center h="$full">
                         <TypeIcon type={item.type} />
                       </Center>
                     }
                   >
-                    <Image
+                    <img
                       src={thumbUrl()}
                       alt={item.name}
-                      w="$full"
-                      h="$full"
-                      objectFit="cover"
                       loading="lazy"
                       decoding="async"
                       draggable={false}
-                      fallback={
-                        <Center h="$full">
-                          <Spinner size="sm" />
-                        </Center>
-                      }
+                      onError={() => setThumbErr(true)}
                     />
                     <Show when={item.type === "video"}>
-                      <Box
-                        pos="absolute"
-                        top="0"
-                        right="0"
-                        bottom="0"
-                        left="0"
-                        display="flex"
-                        alignItems="center"
-                        justifyContent="center"
-                        pointerEvents="none"
-                      >
-                        <Box
-                          css={{
-                            width: 0,
-                            height: 0,
-                            borderTop: "13px solid transparent",
-                            borderBottom: "13px solid transparent",
-                            borderLeft: "20px solid rgba(255,255,255,0.9)",
-                            filter: "drop-shadow(0 1px 3px rgba(0,0,0,0.5))",
-                          }}
-                        />
-                      </Box>
+                      <div class="mv-card-play" />
                     </Show>
                   </Show>
-                  <Box
-                    pos="absolute"
-                    top="$1"
-                    right="$1"
-                    display="flex"
-                    alignItems="center"
-                    gap="5px"
-                    px="7px"
-                    py="4px"
-                    rounded="$full"
-                    css={{
-                      // translucent white without backdrop-filter: dozens of
-                      // these are visible at once and per-badge blur hurts
-                      // scrolling
-                      background: "rgba(255,255,255,0.85)",
-                      border: `1px solid ${MV.hairline}`,
-                      fontSize: "10px",
-                      fontWeight: "$semibold",
-                      lineHeight: 1,
-                      letterSpacing: "0.05em",
-                      textTransform: "uppercase",
-                      color: MV.label2,
-                      pointerEvents: "none",
-                    }}
-                  >
-                    <Box
-                      as="span"
-                      css={{
-                        width: "6px",
-                        height: "6px",
-                        borderRadius: "50%",
-                        background: MV.dot[item.type],
-                        flexShrink: 0,
-                      }}
+                  <div class="mv-card-badge">
+                    <span
+                      class="mv-card-dot"
+                      style={{ background: MV.dot[item.type] }}
                     />
                     {item.type}
-                  </Box>
-                </Box>
-                <Box p="$3" pt="$2_5">
-                  <Text
-                    size="xs"
-                    fontWeight="$semibold"
-                    color={MV.label}
-                    css={{
-                      display: "-webkit-box",
-                      "-webkit-line-clamp": "2",
-                      "-webkit-box-orient": "vertical",
-                      overflow: "hidden",
-                      wordBreak: "break-all",
-                      lineHeight: "1.35",
-                    }}
-                  >
-                    {item.name}
-                  </Text>
-                  <Text size="xs" color={MV.label3} mt="4px">
-                    {formatSize(item.size)}
-                  </Text>
-                </Box>
-              </Box>
+                  </div>
+                </div>
+                <div class="mv-card-cap">
+                  <div class="mv-card-name">{item.name}</div>
+                  <div class="mv-card-size">{formatSize(item.size)}</div>
+                </div>
+              </div>
             )
           }}
         </For>
@@ -1378,7 +1670,12 @@ const MediaView = () => {
             />
           </InputGroup>
           {containerWidth() >= PHONE_W && <Box flex={1} />}
-          <Text size="xs" color={MV.label2} flexShrink={0}>
+          <Text
+            size="xs"
+            color={MV.label2}
+            flexShrink={0}
+            css={{ fontVariantNumeric: "tabular-nums" }}
+          >
             {flatItems().length} items
             <Show when={subDirs().length > 0}>
               {" · "}
@@ -1495,16 +1792,174 @@ const MediaView = () => {
       </Box>
 
       {/* ═══════ Scanning Progress ═══════ */}
-      <Show when={scanMsg()}>
-        <Box px="$3" py="$1" bg="rgba(0,122,255,0.06)" flexShrink={0}>
-          <Text size="xs" css={{ color: MV.accent }}>
-            {scanMsg()}… ({items().length} items found)
-          </Text>
+      {/* a slim travelling light under the top bar; the live item count it
+          used to report already streams into the header counter */}
+      <Show when={scanning()}>
+        <Box
+          flexShrink={0}
+          h="2px"
+          pos="relative"
+          overflow="hidden"
+          bg="rgba(0,122,255,0.10)"
+        >
+          <Box
+            class="mv-scanline"
+            pos="absolute"
+            top="0"
+            bottom="0"
+            w="36%"
+            css={{
+              background: `linear-gradient(90deg, transparent, ${MV.accent}, transparent)`,
+            }}
+          />
         </Box>
       </Show>
 
       {/* ═══════ Main Content ═══════ */}
-      <style>{`.mv-grid, .mv-grid * { box-sizing: border-box; }`}</style>
+      <style>{`
+        .mv-grid, .mv-grid * { box-sizing: border-box; }
+        /* macOS-style thin overlay scrollbar */
+        .mv-grid { scrollbar-width: thin; scrollbar-color: rgba(0,0,0,0.22) transparent; }
+        .mv-grid::-webkit-scrollbar { width: 9px; }
+        .mv-grid::-webkit-scrollbar-track { background: transparent; }
+        .mv-grid::-webkit-scrollbar-thumb {
+          background-color: rgba(0,0,0,0.18);
+          border-radius: 99px;
+          border: 2.5px solid transparent;
+          background-clip: content-box;
+        }
+        .mv-grid::-webkit-scrollbar-thumb:hover { background-color: rgba(0,0,0,0.32); }
+
+        /* lightbox chrome auto-hide */
+        .mv-chrome { transition: opacity 0.3s ease, transform 0.3s ease, visibility 0.3s; }
+        .mv-chrome-off { opacity: 0 !important; visibility: hidden; }
+        .mv-chrome-top.mv-chrome-off { transform: translateY(-10px); }
+        .mv-chrome-bottom.mv-chrome-off { transform: translateY(10px); }
+
+        /* during slides / zoom / pan the glass bars go solid: no backdrop
+           re-blur per frame, near-identical look mid-motion */
+        .mv-glass-off {
+          backdrop-filter: none !important;
+          -webkit-backdrop-filter: none !important;
+          background: rgba(246,246,248,0.95) !important;
+        }
+
+        /* filmstrip cells — active ring driven by class so reused DOM
+           nodes update reactively */
+        .mv-fs-cell {
+          opacity: 0.55;
+          outline: 2px solid transparent;
+          outline-offset: 0;
+          transition: opacity 0.15s ease, outline-color 0.15s ease;
+        }
+        .mv-fs-cell:hover { opacity: 0.85; }
+        .mv-fs-cell.mv-fs-active, .mv-fs-cell.mv-fs-active:hover {
+          opacity: 1;
+          outline-color: ${MV.accent};
+        }
+        .mv-fs-cell:focus-visible { outline-color: ${MV.accent}; }
+
+        /* scan progress: a slim travelling light */
+        @keyframes mvScan { from { left: -40%; } to { left: 104%; } }
+        .mv-scanline { animation: mvScan 1.1s cubic-bezier(0.45,0.05,0.55,0.95) infinite; }
+
+        /* one-time row entrance — plays once per row key, never on re-mount */
+        @keyframes mvRowIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+        .mv-enter { animation: mvRowIn 0.36s cubic-bezier(0.22,0.61,0.36,1) both; }
+
+        /* media cards — plain divs with precompiled classes. A Hope Box per
+           node meant a css-in-js compile + extra component per card at every
+           virtualized row mount, which is exactly the scroll long-task cost:
+           this markup must stay framework-free. */
+        .mv-card {
+          position: relative;
+          background: #fff;
+          border: 1px solid rgba(0, 0, 0, 0.08);
+          border-radius: 12px;
+          overflow: hidden;
+          cursor: pointer;
+          box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 14px rgba(0, 0, 0, 0.05);
+          transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+        }
+        .mv-card:hover {
+          transform: translateY(-2px);
+          box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05), 0 12px 30px rgba(0, 0, 0, 0.1);
+          border-color: rgba(0, 0, 0, 0.12);
+        }
+        .mv-card:hover .mv-card-media img { transform: scale(1.05); }
+        .mv-card-focus {
+          border-color: rgba(0, 122, 255, 0.45);
+          box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.25),
+            0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 14px rgba(0, 0, 0, 0.05);
+        }
+        .mv-card-media {
+          position: relative;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: rgba(0, 0, 0, 0.03);
+          overflow: hidden;
+          aspect-ratio: 4 / 3;
+        }
+        .mv-card-media img {
+          display: block;
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
+          transition: transform 0.5s cubic-bezier(0.22, 0.61, 0.36, 1);
+        }
+        .mv-card-play {
+          position: absolute;
+          inset: 0;
+          margin: auto;
+          width: 0;
+          height: 0;
+          border-top: 13px solid transparent;
+          border-bottom: 13px solid transparent;
+          border-left: 20px solid rgba(255, 255, 255, 0.9);
+          filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
+          pointer-events: none;
+        }
+        .mv-card-badge {
+          position: absolute;
+          top: 4px;
+          right: 4px;
+          display: flex;
+          align-items: center;
+          gap: 5px;
+          padding: 4px 7px;
+          border-radius: 999px;
+          background: rgba(255, 255, 255, 0.85);
+          border: 1px solid rgba(0, 0, 0, 0.08);
+          font-size: 10px;
+          font-weight: 600;
+          line-height: 1;
+          letter-spacing: 0.05em;
+          text-transform: uppercase;
+          color: rgba(60, 60, 67, 0.58);
+          pointer-events: none;
+        }
+        .mv-card-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+        .mv-card-cap { padding: 10px 12px 12px; }
+        .mv-card-name {
+          font-size: 12px;
+          font-weight: 600;
+          line-height: 1.35;
+          color: rgba(60, 60, 67, 0.92);
+          display: -webkit-box;
+          -webkit-line-clamp: 2;
+          -webkit-box-orient: vertical;
+          overflow: hidden;
+          word-break: break-all;
+        }
+        .mv-card-size { font-size: 12px; line-height: 1.4; color: rgba(60, 60, 67, 0.34); margin-top: 4px; }
+
+        @media (prefers-reduced-motion: reduce) {
+          .mv-scanline { animation: none; left: 0; }
+          .mv-enter { animation: none; }
+          .mv-chrome { transition: none; }
+        }
+      `}</style>
       <Box
         ref={scrollRef}
         class="mv-grid"
@@ -1545,6 +2000,11 @@ const MediaView = () => {
                       ? "No media files found"
                       : "No files match filter"}
                   </Text>
+                  <Text size="sm" color={MV.label3} mt="$1">
+                    {items().length === 0
+                      ? "Images, videos, GIFs and text files appear here"
+                      : `Nothing matches “${search()}”`}
+                  </Text>
                 </Box>
               </Center>
             }
@@ -1572,7 +2032,10 @@ const MediaView = () => {
                       transform: `translateY(${vi.start}px)`,
                     }}
                   >
-                    {renderRow(rows()[vi.index])}
+                    <div class={entranceActive() ? "mv-enter" : undefined}>
+                      {" "}
+                      {renderRow(rows()[vi.index])}
+                    </div>
                   </div>
                 )}
               </For>
@@ -1587,24 +2050,233 @@ const MediaView = () => {
           const item = () => currentItem()
           const idx = () => lightboxIndex()!
           const len = () => flatItems().length
+
+          // cursor point in the media's local (un-zoomed) frame: the rect of a
+          // transformed element has its center shifted by pan(), so add it back
+          const localPoint = (
+            e: { clientX: number; clientY: number },
+            el: HTMLElement,
+          ) => {
+            const r = el.getBoundingClientRect()
+            return {
+              x: e.clientX - (r.left + r.width / 2) + pan().x,
+              y: e.clientY - (r.top + r.height / 2) + pan().y,
+            }
+          }
+          const onMediaWheel = (e: WheelEvent) => {
+            if (!canZoom()) return
+            e.preventDefault()
+            e.stopPropagation()
+            wakeChrome()
+            measureMediaIfStale()
+            const p = localPoint(e, e.currentTarget as HTMLElement)
+            // trackpad pinch arrives as ctrl+wheel with tiny deltas — amplify
+            const step = e.ctrlKey ? 0.012 : 0.0016
+            applyZoom(zoomScale() * Math.exp(-e.deltaY * step), p.x, p.y, 0.12)
+            // zooming out in small steps can strand the view just above 1×;
+            // settle it home once the wheel goes quiet
+            clearTimeout(wheelSnapTimer)
+            wheelSnapTimer = setTimeout(snapZoomHome, 180)
+          }
+          const onMediaDblClick = (e: MouseEvent) => {
+            if (!canZoom()) return
+            e.stopPropagation()
+            wakeChrome()
+            measureMedia()
+            const p = localPoint(e, e.currentTarget as HTMLElement)
+            if (zoomScale() > 1.02) resetZoom()
+            else applyZoom(2.5, p.x, p.y, 0.32)
+          }
+          // when setPointerCapture fails the element handlers stop receiving
+          // moves once the pointer leaves the media — window-level fallbacks
+          // keep the drag alive for that case (cleanup hoisted to component
+          // scope so resetZoom can tear it down mid-drag)
+          const dragEnd = () => {
+            dragPid = -1
+            setPanning(false)
+            dragWinCleanup?.()
+            dragWinCleanup = null
+            snapZoomHome()
+          }
+          const onMediaPointerDown = (e: PointerEvent) => {
+            if (e.pointerType === "touch" || zoomScale() <= 1.01) return
+            e.stopPropagation()
+            // a fallback from an earlier drag that never saw up/cancel must
+            // not survive into this one — matches() reads the live dragPid,
+            // so stale listeners would double-process the new pointer
+            dragWinCleanup?.()
+            dragWinCleanup = null
+            dragPid = e.pointerId
+            // state first, capture last: setPointerCapture can throw (pointer
+            // already released) and must not leave the drag half-initialized
+            measureMediaIfStale()
+            panStartPt = { x: e.clientX, y: e.clientY }
+            panStartVal = pan()
+            setPanning(true)
+            setZoomAnim(false)
+            try {
+              ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
+            } catch {
+              const matches = (ev: PointerEvent) => ev.pointerId === dragPid
+              const mv = (ev: PointerEvent) => {
+                if (matches(ev))
+                  scheduleSetPan(
+                    clampPan(
+                      panStartVal.x + ev.clientX - panStartPt.x,
+                      panStartVal.y + ev.clientY - panStartPt.y,
+                      zoomScale(),
+                    ),
+                  )
+              }
+              const up = (ev: PointerEvent) => {
+                if (matches(ev)) dragEnd()
+              }
+              window.addEventListener("pointermove", mv)
+              window.addEventListener("pointerup", up)
+              window.addEventListener("pointercancel", up)
+              dragWinCleanup = () => {
+                window.removeEventListener("pointermove", mv)
+                window.removeEventListener("pointerup", up)
+                window.removeEventListener("pointercancel", up)
+              }
+            }
+          }
+          const onMediaPointerMove = (e: PointerEvent) => {
+            if (dragPid !== e.pointerId) return
+            scheduleSetPan(
+              clampPan(
+                panStartVal.x + e.clientX - panStartPt.x,
+                panStartVal.y + e.clientY - panStartPt.y,
+                zoomScale(),
+              ),
+            )
+          }
+          const onMediaPointerUp = (e: PointerEvent) => {
+            if (dragPid !== e.pointerId) return
+            dragEnd()
+          }
+
+          // zoomable still image: blurred thumbnail base that the full image
+          // fades in over (blur-up), all wrapped in the pan/zoom transform
+          const renderZoomableImage = (it: MediaItem) => {
+            const link = getItemLink(it)
+            const thumb = it.thumb || link
+            const [loaded, setLoaded] = createSignal(false)
+            const [failed, setFailed] = createSignal(false)
+            const settled = () => loaded() && !failed()
+            return (
+              <Box
+                ref={(el: HTMLDivElement) => {
+                  mediaEl = el
+                  measureMedia()
+                }}
+                pos="relative"
+                rounded="$lg"
+                overflow="hidden"
+                onClick={(e: MouseEvent) => e.stopPropagation()}
+                onDblClick={onMediaDblClick}
+                onWheel={onMediaWheel}
+                onPointerDown={onMediaPointerDown}
+                onPointerMove={onMediaPointerMove}
+                onPointerUp={onMediaPointerUp}
+                onPointerCancel={onMediaPointerUp}
+                // transform + transition live in `style`, not `css`: they
+                // change every frame during a gesture and a plain style write
+                // skips re-running the css-in-js pipeline per frame
+                style={{
+                  transform: `translate3d(${pan().x}px, ${pan().y}px, 0) scale(${zoom()})`,
+                  transition:
+                    zoomAnim() !== false
+                      ? `transform ${zoomAnim()}s cubic-bezier(0.22,0.61,0.36,1)`
+                      : "none",
+                }}
+                css={{
+                  transformOrigin: "center",
+                  boxShadow: MV.shadowStage,
+                  cursor:
+                    zoom() > 1.01
+                      ? panning()
+                        ? "grabbing"
+                        : "grab"
+                      : "zoom-in",
+                  // zoomed: every gesture belongs to the image (pan / pinch).
+                  // at rest pan-y keeps the stage's swipe-browse working.
+                  touchAction: zoom() > 1.01 ? "none" : "pan-y",
+                }}
+              >
+                <Box
+                  as="img"
+                  src={thumb}
+                  alt=""
+                  draggable={false}
+                  pos="absolute"
+                  top="0"
+                  left="0"
+                  w="$full"
+                  h="$full"
+                  objectFit="cover"
+                  css={{
+                    // the blur is a compositing cost the GPU pays for every
+                    // frame of every later animation — once the full image
+                    // has landed the base layer leaves the paint tree
+                    // entirely (no filter, no visibility). Visibility hides
+                    // on a delay so it stays visible through the 300ms
+                    // crossfade instead of flashing the stage behind it.
+                    opacity: settled() ? 0 : 1,
+                    visibility: settled() ? "hidden" : "visible",
+                    filter: settled() ? "none" : "blur(18px) saturate(1.2)",
+                    transform: "scale(1.12)", // grow past the clip to hide the blur fringe
+                    transition:
+                      "opacity 0.35s ease, visibility 0s linear 0.35s",
+                    pointerEvents: "none",
+                  }}
+                />
+                <Box
+                  as="img"
+                  src={link}
+                  alt={it.name}
+                  draggable={false}
+                  decoding="async"
+                  onLoad={() => setLoaded(true)}
+                  onError={() => setFailed(true)}
+                  css={{
+                    display: "block",
+                    maxWidth: "92vw",
+                    maxHeight: "90vh",
+                    width: "auto",
+                    height: "auto",
+                    objectFit: "contain",
+                    opacity: settled() ? 1 : 0,
+                    transition: "opacity 0.3s ease",
+                  }}
+                />
+              </Box>
+            )
+          }
+
           // Render a single media item (image / video / text). `exiting`
           // mutes + pauses video so the outgoing copy doesn't double the audio.
           const renderMediaItem = (it: MediaItem, exiting = false) => {
             const link = getItemLink(it)
             if (it.type === "image" || it.type === "gif") {
-              return (
-                <Image
-                  src={link}
-                  alt={it.name}
-                  maxW="92%"
-                  maxH="90vh"
-                  objectFit="contain"
-                  rounded="$lg"
-                  decoding="async"
-                  draggable={false}
-                  onClick={(e: MouseEvent) => e.stopPropagation()}
-                />
-              )
+              // the exiting snapshot is normally already decoded — plain img,
+              // no blur-up, no zoom machinery (it is pointer-events:none)
+              if (exiting)
+                return (
+                  <Image
+                    src={link}
+                    alt={it.name}
+                    maxW="92%"
+                    maxH="90vh"
+                    objectFit="contain"
+                    rounded="$lg"
+                    css={{ boxShadow: MV.shadowStage }}
+                    decoding="async"
+                    draggable={false}
+                    onClick={(e: MouseEvent) => e.stopPropagation()}
+                  />
+                )
+              return renderZoomableImage(it)
             }
             if (it.type === "video") {
               return (
@@ -1687,15 +2359,18 @@ const MediaView = () => {
                 .mv-out-prev { animation: mvOutPrev 0.32s cubic-bezier(0.22,0.61,0.36,1) forwards; }
                 .mv-in-open  { animation: mvInOpen  0.2s ease-out; }
                 html, body { overscroll-behavior-x: none !important; }
+                @media (prefers-reduced-motion: reduce) {
+                  .mv-in-next, .mv-in-prev, .mv-out-next, .mv-out-prev, .mv-in-open { animation: none; }
+                }
               `}</style>
-              {/* backdrop */}
+              {/* backdrop — a whisper of depth instead of flat paper */}
               <Box
                 pos="absolute"
                 top="0"
                 right="0"
                 bottom="0"
                 left="0"
-                css={{ background: MV.bg }}
+                css={{ background: MV.stageGrad }}
               />
               {/* media stage — full screen; swipe to browse, tap to close */}
               <Box
@@ -1714,19 +2389,194 @@ const MediaView = () => {
                   overflow: "hidden",
                 }}
                 onTouchStart={(e: TouchEvent) => {
+                  clearTimeout(tapTimer) // a new touch cancels a pending close
                   touchStartX = e.touches[0].clientX
                   touchStartY = e.touches[0].clientY
                   touchMoved = false
                   touchStartTarget = e.target as HTMLElement | null
+                  multiTouch = e.touches.length >= 2
+                  touchPanBase = null // created lazily on first real movement
+                  pinchStart = null
+                  if (multiTouch && canZoom()) {
+                    // flush any frame the previous gesture phase queued, so
+                    // this baseline reads the latest committed pan/zoom (a
+                    // 1→2 or 2→3 contact jump otherwise baselines stale)
+                    flushPanRaf()
+                    setTouchGesture(true)
+                    measureMediaIfStale()
+                    const [a, b] = [e.touches[0], e.touches[1]]
+                    // media center in client coords, un-zoomed: the visual
+                    // center is shifted by the current pan, so subtract it
+                    const r = mediaEl?.getBoundingClientRect()
+                    const cx = r
+                      ? r.left + r.width / 2 - pan().x
+                      : window.innerWidth / 2
+                    const cy = r
+                      ? r.top + r.height / 2 - pan().y
+                      : window.innerHeight / 2
+                    pinchStart = {
+                      d: Math.hypot(
+                        a.clientX - b.clientX,
+                        a.clientY - b.clientY,
+                      ),
+                      z: zoomScale(),
+                      pan: pan(),
+                      mx: (a.clientX + b.clientX) / 2,
+                      my: (a.clientY + b.clientY) / 2,
+                      cx,
+                      cy,
+                    }
+                    pinchFingers = e.touches.length
+                    touchMoved = true
+                  }
                 }}
                 onTouchMove={(e: TouchEvent) => {
+                  if (pinchStart && e.touches.length >= 2) {
+                    // a finger joining or leaving changes the contact set —
+                    // re-baseline so the remaining pair doesn't jump. Flush
+                    // any pending frame first so the new baseline reflects
+                    // the gesture's latest committed state, not the one
+                    // before the queued rAF write.
+                    if (pinchFingers !== e.touches.length) {
+                      flushPanRaf()
+                      const [a, b] = [e.touches[0], e.touches[1]]
+                      const r = mediaEl?.getBoundingClientRect()
+                      pinchStart = {
+                        d: Math.hypot(
+                          a.clientX - b.clientX,
+                          a.clientY - b.clientY,
+                        ),
+                        z: zoomScale(),
+                        pan: pan(),
+                        mx: (a.clientX + b.clientX) / 2,
+                        my: (a.clientY + b.clientY) / 2,
+                        cx: r
+                          ? r.left + r.width / 2 - pan().x
+                          : window.innerWidth / 2,
+                        cy: r
+                          ? r.top + r.height / 2 - pan().y
+                          : window.innerHeight / 2,
+                      }
+                      pinchFingers = e.touches.length
+                      return
+                    }
+                    const [a, b] = [e.touches[0], e.touches[1]]
+                    const d = Math.hypot(
+                      a.clientX - b.clientX,
+                      a.clientY - b.clientY,
+                    )
+                    const mx = (a.clientX + b.clientX) / 2
+                    const my = (a.clientY + b.clientY) / 2
+                    const z = Math.max(
+                      1,
+                      Math.min(8, pinchStart.z * (d / pinchStart.d)),
+                    )
+                    // anchor the content under the fingers' midpoint:
+                    // pan' = mid' − C − (mid₀ − C − pan₀)·(z/z₀)
+                    const s = z / pinchStart.z
+                    scheduleSetPan(
+                      clampPan(
+                        mx -
+                          pinchStart.cx -
+                          (pinchStart.mx - pinchStart.cx - pinchStart.pan.x) *
+                            s,
+                        my -
+                          pinchStart.cy -
+                          (pinchStart.my - pinchStart.cy - pinchStart.pan.y) *
+                            s,
+                        z,
+                      ),
+                      z,
+                    )
+                    setZoomAnim(false)
+                    return
+                  }
+                  // zoomed: one finger that actually MOVES drags the image.
+                  // Created here (not on touchstart) so a stationary tap on a
+                  // zoomed image still reaches the double-tap logic below.
+                  if (
+                    !multiTouch &&
+                    !pinchStart &&
+                    canZoom() &&
+                    zoomScale() > 1.01 &&
+                    e.touches.length === 1
+                  ) {
+                    const dx0 = e.touches[0].clientX - touchStartX
+                    const dy0 = e.touches[0].clientY - touchStartY
+                    // Euclidean: an 8×8 diagonal is a real move, a slow 9px
+                    // axis drift is still close enough to a tap
+                    if (Math.hypot(dx0, dy0) > 10) {
+                      if (!touchPanBase) {
+                        touchPanBase = {
+                          x: touchStartX,
+                          y: touchStartY,
+                          px: pan().x,
+                          py: pan().y,
+                        }
+                        setTouchGesture(true)
+                      }
+                      scheduleSetPan(
+                        clampPan(
+                          touchPanBase.px + dx0,
+                          touchPanBase.py + dy0,
+                          zoomScale(),
+                        ),
+                      )
+                      touchMoved = true
+                      return
+                    }
+                  }
                   const dx = e.touches[0].clientX - touchStartX
                   const dy = e.touches[0].clientY - touchStartY
                   if (Math.abs(dx) > 10 || Math.abs(dy) > 10) touchMoved = true
                 }}
                 onTouchEnd={(e: TouchEvent) => {
-                  const dx = e.changedTouches[0].clientX - touchStartX
-                  const dy = e.changedTouches[0].clientY - touchStartY
+                  const allUp = e.touches.length === 0
+                  // the tail of a pinch / zoomed drag is never a swipe or tap
+                  if (multiTouch || touchPanBase) {
+                    if (allUp) {
+                      multiTouch = false
+                      pinchStart = null
+                      pinchFingers = 0
+                      touchPanBase = null
+                      setTouchGesture(false)
+                      snapZoomHome()
+                    }
+                    return
+                  }
+                  lastTouchAt = Date.now()
+                  const px = e.changedTouches[0].clientX
+                  const py = e.changedTouches[0].clientY
+                  lastTouchClickPt = { x: px, y: py }
+                  const dx = px - touchStartX
+                  const dy = py - touchStartY
+                  if (canZoom() && !touchMoved) {
+                    const now = Date.now()
+                    // double-tap toggles zoom at the tapped point
+                    if (
+                      now - lastTapAt < TAP_WINDOW_MS &&
+                      Math.hypot(px - lastTapPt.x, py - lastTapPt.y) < 44
+                    ) {
+                      clearTimeout(tapTimer)
+                      lastTapAt = 0
+                      measureMediaIfStale()
+                      const p = mediaEl
+                        ? localPoint({ clientX: px, clientY: py }, mediaEl)
+                        : { x: 0, y: 0 }
+                      if (zoomScale() > 1.02) resetZoom()
+                      else applyZoom(2.5, p.x, p.y, 0.3)
+                      return
+                    }
+                    lastTapAt = now
+                    lastTapPt = { x: px, y: py }
+                    clearTimeout(tapTimer)
+                    // single tap closes — but only at rest (while zoomed, a
+                    // single tap keeps the unadorned view; double-tap resets),
+                    // and only after a second tap could still land
+                    if (zoomScale() <= 1.02)
+                      tapTimer = setTimeout(() => closeLightbox(), TAP_CLOSE_MS)
+                    return
+                  }
                   if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) {
                     // horizontal swipe → browse (left=prev, right=next). On video,
                     // ignore swipes that start on the bottom control bar so the
@@ -1745,10 +2595,34 @@ const MediaView = () => {
                     closeLightbox()
                   }
                 }}
-                onClick={() => {
+                onTouchCancel={(e: TouchEvent) => {
+                  // a canceled sequence (browser gesture, palm rejection) must
+                  // still release the latches — and drop the frame it queued:
+                  // applying it after cancellation can strand a near-1× zoom
+                  if (e.touches.length === 0) {
+                    multiTouch = false
+                    pinchStart = null
+                    pinchFingers = 0
+                    touchPanBase = null
+                    setTouchGesture(false)
+                    clearTimeout(tapTimer)
+                    cancelPanRaf()
+                    snapZoomHome()
+                  }
+                }}
+                onClick={(e: MouseEvent) => {
                   // tap empty area to close; a swipe sets touchMoved so it
-                  // won't also close
-                  if (!touchMoved) closeLightbox()
+                  // won't also close. The synthetic click trailing a touch is
+                  // suppressed — but only near the touch, so a mouse click on
+                  // a hybrid device still works — and taps on touch are owned
+                  // by onTouchEnd (double-tap needs a delayed close).
+                  const nearTouch =
+                    Date.now() - lastTouchAt <= 500 &&
+                    Math.hypot(
+                      e.clientX - lastTouchClickPt.x,
+                      e.clientY - lastTouchClickPt.y,
+                    ) < 44
+                  if (!touchMoved && !nearTouch) closeLightbox()
                 }}
               >
                 <Show when={outgoing()} keyed>
@@ -1795,8 +2669,10 @@ const MediaView = () => {
                   )}
                 </For>
               </Box>
-              {/* top overlay — frosted bar with filename + close (click-through) */}
+              {/* top overlay — frosted bar with type badge, filename, download
+                  and close (click-through) */}
               <Box
+                class={`mv-chrome mv-chrome-top${chromeHidden() ? " mv-chrome-off" : ""}${motionActive() ? " mv-glass-off" : ""}`}
                 pos="absolute"
                 top="0"
                 left="0"
@@ -1817,6 +2693,39 @@ const MediaView = () => {
                   px="$3"
                   py="$2_5"
                 >
+                  <Show when={item()}>
+                    <Box
+                      as="span"
+                      flexShrink={0}
+                      css={{
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "6px",
+                        background: "rgba(0,0,0,0.05)",
+                        border: `1px solid ${MV.hairline}`,
+                        borderRadius: "999px",
+                        padding: "3px 9px",
+                        fontSize: "10px",
+                        fontWeight: 600,
+                        letterSpacing: "0.05em",
+                        textTransform: "uppercase",
+                        color: MV.label2,
+                        lineHeight: 1,
+                      }}
+                    >
+                      <Box
+                        as="span"
+                        css={{
+                          width: "6px",
+                          height: "6px",
+                          borderRadius: "50%",
+                          background: MV.dot[item()!.type],
+                          flexShrink: 0,
+                        }}
+                      />
+                      {item()!.type}
+                    </Box>
+                  </Show>
                   <Text
                     flex={1}
                     size="sm"
@@ -1830,6 +2739,32 @@ const MediaView = () => {
                   >
                     {item()?.name}
                   </Text>
+                  <Show when={item()}>
+                    <Box
+                      as="a"
+                      href={getItemLink(item()!)}
+                      download=""
+                      target="_blank"
+                      rel="noopener"
+                      aria-label="Download"
+                      flexShrink={0}
+                      w="32px"
+                      h="32px"
+                      display="flex"
+                      alignItems="center"
+                      justifyContent="center"
+                      rounded="$full"
+                      color={MV.label}
+                      css={{
+                        pointerEvents: "auto",
+                        background: "rgba(0,0,0,0.05)",
+                        "&:hover": { background: "rgba(0,0,0,0.10)" },
+                      }}
+                      onClick={(e: MouseEvent) => e.stopPropagation()}
+                    >
+                      <Box as={BsDownload} boxSize="15px" />
+                    </Box>
+                  </Show>
                   <IconButton
                     aria-label="Close"
                     icon={<BsX />}
@@ -1846,8 +2781,10 @@ const MediaView = () => {
                   />
                 </Box>
               </Box>
-              {/* bottom overlay — frosted bar with counter + hints (click-through) */}
+              {/* bottom overlay — frosted bar with filmstrip, counter + hints
+                  (click-through; strip and pill opt back in) */}
               <Box
+                class={`mv-chrome mv-chrome-bottom${chromeHidden() ? " mv-chrome-off" : ""}${motionActive() ? " mv-glass-off" : ""}`}
                 pos="absolute"
                 bottom="0"
                 left="0"
@@ -1861,6 +2798,109 @@ const MediaView = () => {
                   borderTop: `1px solid ${MV.hairline}`,
                 }}
               >
+                {/* filmstrip — windowed thumbnails around the current item;
+                    click to jump, the active one carries an accent ring */}
+                <Show
+                  when={
+                    FINE_POINTER &&
+                    containerWidth() >= PHONE_W &&
+                    flatItems().length > 1
+                  }
+                >
+                  <Box
+                    ref={(el: HTMLDivElement) => {
+                      stripRef = el
+                    }}
+                    display="flex"
+                    gap="$1_5"
+                    overflowX="auto"
+                    px="$3"
+                    pt="$2"
+                    css={{
+                      pointerEvents: "auto",
+                      scrollbarWidth: "none",
+                      "&::-webkit-scrollbar": { display: "none" },
+                      overscrollBehaviorX: "contain",
+                    }}
+                  >
+                    <For each={filmstripWindow()}>
+                      {(i) => {
+                        const it = flatItems()[i]
+                        const src =
+                          it.type === "text" ? "" : it.thumb || getItemLink(it)
+                        // class-driven active state: the attribute expression
+                        // below re-runs when idx() changes, and Solid's For
+                        // REUSES DOM nodes for unchanged items — a css object
+                        // baked once per node would freeze the ring in place
+                        const cellClass = () =>
+                          `mv-fs-cell${i === idx() ? " mv-fs-active" : ""}`
+                        // static sizing only (identical for both cell kinds)
+                        const cellCss = {
+                          height: "44px",
+                          width: "58px",
+                          objectFit: "cover" as const,
+                          borderRadius: "8px",
+                          cursor: "pointer",
+                          flexShrink: 0,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          background: src ? "none" : "rgba(0,0,0,0.05)",
+                        }
+                        const jump = (e: MouseEvent) => {
+                          e.stopPropagation()
+                          gotoLightbox(i)
+                        }
+                        const jumpKeys = (e: KeyboardEvent) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault()
+                            gotoLightbox(i)
+                          }
+                        }
+                        return (
+                          <Show
+                            when={src}
+                            fallback={
+                              <Box
+                                as="button"
+                                type="button"
+                                class={cellClass()}
+                                data-fs-index={i}
+                                aria-label={it.name}
+                                onClick={jump}
+                                onKeyDown={jumpKeys}
+                                css={cellCss}
+                              >
+                                <Box
+                                  as={FiType}
+                                  boxSize="14px"
+                                  color={MV.dot.text}
+                                />
+                              </Box>
+                            }
+                          >
+                            <Box
+                              as="img"
+                              src={src}
+                              alt=""
+                              draggable={false}
+                              loading="lazy"
+                              decoding="async"
+                              tabIndex={0}
+                              role="button"
+                              class={cellClass()}
+                              data-fs-index={i}
+                              aria-label={it.name}
+                              onClick={jump}
+                              onKeyDown={jumpKeys}
+                              css={cellCss}
+                            />
+                          </Show>
+                        )
+                      }}
+                    </For>
+                  </Box>
+                </Show>
                 <Box
                   display="flex"
                   alignItems="center"
@@ -1873,14 +2913,43 @@ const MediaView = () => {
                     css={{
                       color: MV.label2,
                       whiteSpace: "nowrap",
+                      fontVariantNumeric: "tabular-nums",
                     }}
                   >
                     {idx() + 1} / {len()}
                     <Show when={item()}>
                       {" · "}
                       {formatSize(item()!.size)}
+                      <Show when={formatDate(item()!.modified)}>
+                        {" · "}
+                        {formatDate(item()!.modified)}
+                      </Show>
                     </Show>
                   </Text>
+                  <Show when={zoomScale() > 1.02}>
+                    <Box
+                      as="button"
+                      onClick={(e: MouseEvent) => {
+                        e.stopPropagation()
+                        resetZoom()
+                      }}
+                      css={{
+                        pointerEvents: "auto",
+                        background: "rgba(0,0,0,0.05)",
+                        border: `1px solid ${MV.hairline}`,
+                        borderRadius: "999px",
+                        padding: "3px 10px",
+                        fontSize: "11px",
+                        fontWeight: 600,
+                        lineHeight: 1.4,
+                        color: MV.label2,
+                        cursor: "pointer",
+                        fontVariantNumeric: "tabular-nums",
+                      }}
+                    >
+                      {zoomScale().toFixed(1)}×
+                    </Box>
+                  </Show>
                   <Show when={FINE_POINTER && containerWidth() >= PHONE_W}>
                     <Box
                       flex={1}
@@ -1912,6 +2981,20 @@ const MediaView = () => {
                         </Kbd>{" "}
                         close
                       </Text>
+                      <Show when={canZoom()}>
+                        <Text size="xs" css={{ color: MV.label3 }}>
+                          <Kbd
+                            css={{
+                              background: "rgba(0,0,0,0.05)",
+                              borderColor: MV.hairline,
+                              color: MV.label2,
+                            }}
+                          >
+                            dbl-click
+                          </Kbd>{" "}
+                          zoom
+                        </Text>
+                      </Show>
                     </Box>
                   </Show>
                 </Box>
@@ -1922,6 +3005,7 @@ const MediaView = () => {
                 <Show when={idx() > 0}>
                   <IconButton
                     aria-label="Previous"
+                    class={`mv-chrome${chromeHidden() ? " mv-chrome-off" : ""}${motionActive() ? " mv-glass-off" : ""}`}
                     icon={<BsChevronLeft />}
                     variant="ghost"
                     color={MV.label}
@@ -1948,6 +3032,7 @@ const MediaView = () => {
                 <Show when={idx() < len() - 1}>
                   <IconButton
                     aria-label="Next"
+                    class={`mv-chrome${chromeHidden() ? " mv-chrome-off" : ""}${motionActive() ? " mv-glass-off" : ""}`}
                     icon={<BsChevronRight />}
                     variant="ghost"
                     color={MV.label}
@@ -2120,6 +3205,8 @@ const MediaView = () => {
                   items: [
                     ["← → / h l", "Previous / next"],
                     ["↑↓ / Esc", "Close preview"],
+                    ["+ / − / 0", "Zoom in / out / reset"],
+                    ["dbl-click · wheel", "Zoom at point"],
                   ],
                 },
               ]}
