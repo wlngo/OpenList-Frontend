@@ -840,7 +840,7 @@ const MediaView = () => {
     const cardEst = cardRowHeight()
     const out: Row[] = []
     for (const g of folderGroups()) {
-      out.push({ key: `h:${g.path}`, kind: "header", group: g, est: 48 })
+      out.push({ key: `h:${g.path}`, kind: "header", group: g, est: 72 })
       const texts = g.items.filter((i) => i.type === "text")
       const media = g.items.filter((i) => i.type !== "text")
       for (const t of texts)
@@ -1535,48 +1535,55 @@ const MediaView = () => {
     if (!row) return null
     if (row.kind === "header") {
       return (
-        <Box
-          display="flex"
-          alignItems="center"
-          gap="$2"
-          pb="$3"
-          borderBottom={`1px solid ${MV.hairline}`}
-        >
+        // pt separates GROUPS from the rows above (16px + the previous row's
+        // 12px bottom padding reads clearly as a new section, vs the 12px
+        // rhythm between rows); the spacer below the hairline gives the
+        // divider room to breathe instead of hugging the first card
+        <Box pt="$4">
           <Box
-            as={AiOutlineFolder}
-            boxSize="$5"
-            color={MV.accent}
-            flexShrink={0}
-          />
-          <Text
-            size="base"
-            fontWeight="$semibold"
-            color={MV.label}
-            flex={1}
-            css={{
-              whiteSpace: "nowrap",
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              minWidth: "0",
-            }}
+            display="flex"
+            alignItems="center"
+            gap="$2"
+            pb="$2_5"
+            borderBottom={`1px solid ${MV.hairline}`}
           >
-            {row.group.displayName}
-          </Text>
-          <Box
-            as="span"
-            css={{
-              background: "rgba(0,0,0,0.05)",
-              color: MV.label2,
-              fontSize: "11px",
-              fontWeight: "$medium",
-              lineHeight: 1,
-              padding: "4px 9px",
-              borderRadius: "999px",
-              flexShrink: 0,
-            }}
-          >
-            {row.group.items.length}
+            <Box
+              as={AiOutlineFolder}
+              boxSize="$5"
+              color={MV.accent}
+              flexShrink={0}
+            />
+            <Text
+              size="base"
+              fontWeight="$semibold"
+              color={MV.label}
+              flex={1}
+              css={{
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                minWidth: "0",
+              }}
+            >
+              {row.group.displayName}
+            </Text>
+            <Box
+              as="span"
+              css={{
+                background: "rgba(0,0,0,0.05)",
+                color: MV.label2,
+                fontSize: "11px",
+                fontWeight: "$medium",
+                lineHeight: 1,
+                padding: "4px 9px",
+                borderRadius: "999px",
+                flexShrink: 0,
+              }}
+            >
+              {row.group.items.length}
+            </Box>
           </Box>
+          <Box h="12px" />
         </Box>
       )
     }
@@ -1779,6 +1786,8 @@ const MediaView = () => {
       }}
     >
       {/* ═══════ Top Bar ═══════ */}
+      {/* one compact toolbar row on desktop (search, folders and the count
+          join the title); phones keep the stacked rows so nothing squeezes */}
       <Box
         flexShrink={0}
         zIndex={10}
@@ -1824,6 +1833,140 @@ const MediaView = () => {
               {folderPath()}
             </Text>
           </Box>
+          <Show when={containerWidth() >= PHONE_W}>
+            <Text
+              size="xs"
+              color={MV.label2}
+              flexShrink={0}
+              css={{ fontVariantNumeric: "tabular-nums" }}
+            >
+              {flatItems().length} items
+              <Show when={subDirs().length > 0}>
+                {" · "}
+                {subDirs().length} folders
+              </Show>
+            </Text>
+            <InputGroup size="sm" w="200px" flexShrink={0}>
+              <InputLeftElement pointerEvents="none">
+                <Box as={AiOutlineSearch} color={MV.label3} />
+              </InputLeftElement>
+              <Input
+                placeholder="Filter files…"
+                value={search()}
+                onInput={(e) => setSearch(e.currentTarget.value)}
+                css={{
+                  background: MV.surface,
+                  borderColor: MV.hairline,
+                  color: MV.label,
+                  "&::placeholder": { color: MV.label3 },
+                }}
+              />
+            </InputGroup>
+            <Show when={subDirs().length > 0}>
+              <Popover placement="bottom-start">
+                {({ onClose }) => (
+                  <>
+                    <PopoverTrigger
+                      as={Button}
+                      variant="outline"
+                      size="sm"
+                      css={{
+                        background: MV.surface,
+                        borderColor: MV.hairline,
+                        color: MV.label,
+                      }}
+                    >
+                      <Box as={AiOutlineFolder} boxSize="14px" flexShrink={0} />
+                      Folders
+                      <Box
+                        as="span"
+                        css={{
+                          background: "rgba(0,0,0,0.05)",
+                          color: MV.label2,
+                          fontSize: "11px",
+                          fontWeight: "$medium",
+                          lineHeight: 1,
+                          padding: "3px 8px",
+                          borderRadius: "999px",
+                          marginLeft: "$1",
+                        }}
+                      >
+                        {subDirs().length}
+                      </Box>
+                    </PopoverTrigger>
+                    <PopoverContent
+                      w="280px"
+                      css={{
+                        background: MV.surface,
+                        border: `1px solid ${MV.hairline}`,
+                        boxShadow: MV.shadowPop,
+                        borderRadius: "14px",
+                      }}
+                    >
+                      <PopoverBody p="$1" display="flex" flexDirection="column">
+                        <Input
+                          placeholder="Filter folders…"
+                          value={dirFilter()}
+                          onInput={(e) => setDirFilter(e.currentTarget.value)}
+                          size="sm"
+                          mb="$1"
+                          css={{
+                            background: MV.surface,
+                            borderColor: MV.hairline,
+                            color: MV.label,
+                            "&::placeholder": { color: MV.label3 },
+                          }}
+                        />
+                        <Box maxH="50vh" overflowY="auto">
+                          <For each={filteredSubDirs()}>
+                            {(sub) => {
+                              const name = sub.split("/").pop() || sub
+                              return (
+                                <Box
+                                  display="flex"
+                                  alignItems="center"
+                                  gap="$2"
+                                  px="$2"
+                                  py="$1_5"
+                                  rounded="$md"
+                                  cursor="pointer"
+                                  _hover={{ bg: "rgba(0,0,0,0.04)" }}
+                                  onClick={() => {
+                                    onClose()
+                                    setDirFilter("")
+                                    scrollToFolder(sub)
+                                  }}
+                                >
+                                  <Box
+                                    as={AiOutlineFolder}
+                                    boxSize="14px"
+                                    color={MV.accent}
+                                    flexShrink={0}
+                                  />
+                                  <Text
+                                    size="sm"
+                                    color={MV.label}
+                                    css={{ wordBreak: "break-all" }}
+                                  >
+                                    {name}
+                                  </Text>
+                                </Box>
+                              )
+                            }}
+                          </For>
+                          <Show when={filteredSubDirs().length === 0}>
+                            <Text size="xs" color={MV.label3} px="$2" py="$2">
+                              No folders match
+                            </Text>
+                          </Show>
+                        </Box>
+                      </PopoverBody>
+                    </PopoverContent>
+                  </>
+                )}
+              </Popover>
+            </Show>
+          </Show>
           <Show when={scanning()}>
             <Spinner size="sm" color={MV.accent} />
           </Show>
@@ -1850,153 +1993,151 @@ const MediaView = () => {
           </Tooltip>
         </Box>
 
-        <Box
-          display="flex"
-          alignItems="center"
-          gap="$2"
-          px="$3"
-          pb="$2"
-          flexWrap="wrap"
-        >
-          <InputGroup
-            size="sm"
-            w={containerWidth() < PHONE_W ? "100%" : "220px"}
-            flexShrink={0}
+        {/* phones: search goes full-width on its own row, folders below */}
+        <Show when={containerWidth() < PHONE_W}>
+          <Box
+            display="flex"
+            alignItems="center"
+            gap="$2"
+            px="$3"
+            pb="$2"
+            flexWrap="wrap"
           >
-            <InputLeftElement pointerEvents="none">
-              <Box as={AiOutlineSearch} color={MV.label3} />
-            </InputLeftElement>
-            <Input
-              placeholder="Filter files…"
-              value={search()}
-              onInput={(e) => setSearch(e.currentTarget.value)}
-              css={{
-                background: MV.surface,
-                borderColor: MV.hairline,
-                color: MV.label,
-                "&::placeholder": { color: MV.label3 },
-              }}
-            />
-          </InputGroup>
-          {containerWidth() >= PHONE_W && <Box flex={1} />}
-          <Text
-            size="xs"
-            color={MV.label2}
-            flexShrink={0}
-            css={{ fontVariantNumeric: "tabular-nums" }}
-          >
-            {flatItems().length} items
-            <Show when={subDirs().length > 0}>
-              {" · "}
-              {subDirs().length} folders
-            </Show>
-          </Text>
-        </Box>
-        <Show when={subDirs().length > 0}>
-          <Box px="$3" pb="$2" flexShrink={0}>
-            <Popover placement="bottom-start">
-              {({ onClose }) => (
-                <>
-                  <PopoverTrigger
-                    as={Button}
-                    variant="outline"
-                    size="sm"
-                    css={{
-                      background: MV.surface,
-                      borderColor: MV.hairline,
-                      color: MV.label,
-                    }}
-                  >
-                    <Box as={AiOutlineFolder} boxSize="14px" flexShrink={0} />
-                    Folders
-                    <Box
-                      as="span"
+            <InputGroup size="sm" w="100%" flexShrink={0}>
+              <InputLeftElement pointerEvents="none">
+                <Box as={AiOutlineSearch} color={MV.label3} />
+              </InputLeftElement>
+              <Input
+                placeholder="Filter files…"
+                value={search()}
+                onInput={(e) => setSearch(e.currentTarget.value)}
+                css={{
+                  background: MV.surface,
+                  borderColor: MV.hairline,
+                  color: MV.label,
+                  "&::placeholder": { color: MV.label3 },
+                }}
+              />
+            </InputGroup>
+            <Text
+              size="xs"
+              color={MV.label2}
+              flexShrink={0}
+              css={{ fontVariantNumeric: "tabular-nums" }}
+            >
+              {flatItems().length} items
+              <Show when={subDirs().length > 0}>
+                {" · "}
+                {subDirs().length} folders
+              </Show>
+            </Text>
+          </Box>
+          <Show when={subDirs().length > 0}>
+            <Box px="$3" pb="$2" flexShrink={0}>
+              <Popover placement="bottom-start">
+                {({ onClose }) => (
+                  <>
+                    <PopoverTrigger
+                      as={Button}
+                      variant="outline"
+                      size="sm"
                       css={{
-                        background: "rgba(0,0,0,0.05)",
-                        color: MV.label2,
-                        fontSize: "11px",
-                        fontWeight: "$medium",
-                        lineHeight: 1,
-                        padding: "3px 8px",
-                        borderRadius: "999px",
-                        marginLeft: "$1",
+                        background: MV.surface,
+                        borderColor: MV.hairline,
+                        color: MV.label,
                       }}
                     >
-                      {subDirs().length}
-                    </Box>
-                  </PopoverTrigger>
-                  <PopoverContent
-                    w="280px"
-                    css={{
-                      background: MV.surface,
-                      border: `1px solid ${MV.hairline}`,
-                      boxShadow: MV.shadowPop,
-                      borderRadius: "14px",
-                    }}
-                  >
-                    <PopoverBody p="$1" display="flex" flexDirection="column">
-                      <Input
-                        placeholder="Filter folders…"
-                        value={dirFilter()}
-                        onInput={(e) => setDirFilter(e.currentTarget.value)}
-                        size="sm"
-                        mb="$1"
+                      <Box as={AiOutlineFolder} boxSize="14px" flexShrink={0} />
+                      Folders
+                      <Box
+                        as="span"
                         css={{
-                          background: MV.surface,
-                          borderColor: MV.hairline,
-                          color: MV.label,
-                          "&::placeholder": { color: MV.label3 },
+                          background: "rgba(0,0,0,0.05)",
+                          color: MV.label2,
+                          fontSize: "11px",
+                          fontWeight: "$medium",
+                          lineHeight: 1,
+                          padding: "3px 8px",
+                          borderRadius: "999px",
+                          marginLeft: "$1",
                         }}
-                      />
-                      <Box maxH="50vh" overflowY="auto">
-                        <For each={filteredSubDirs()}>
-                          {(sub) => {
-                            const name = sub.split("/").pop() || sub
-                            return (
-                              <Box
-                                display="flex"
-                                alignItems="center"
-                                gap="$2"
-                                px="$2"
-                                py="$1_5"
-                                rounded="$md"
-                                cursor="pointer"
-                                _hover={{ bg: "rgba(0,0,0,0.04)" }}
-                                onClick={() => {
-                                  onClose()
-                                  setDirFilter("")
-                                  scrollToFolder(sub)
-                                }}
-                              >
-                                <Box
-                                  as={AiOutlineFolder}
-                                  boxSize="14px"
-                                  color={MV.accent}
-                                  flexShrink={0}
-                                />
-                                <Text
-                                  size="sm"
-                                  color={MV.label}
-                                  css={{ wordBreak: "break-all" }}
-                                >
-                                  {name}
-                                </Text>
-                              </Box>
-                            )
-                          }}
-                        </For>
-                        <Show when={filteredSubDirs().length === 0}>
-                          <Text size="xs" color={MV.label3} px="$2" py="$2">
-                            No folders match
-                          </Text>
-                        </Show>
+                      >
+                        {subDirs().length}
                       </Box>
-                    </PopoverBody>
-                  </PopoverContent>
-                </>
-              )}
-            </Popover>
-          </Box>
+                    </PopoverTrigger>
+                    <PopoverContent
+                      w="280px"
+                      css={{
+                        background: MV.surface,
+                        border: `1px solid ${MV.hairline}`,
+                        boxShadow: MV.shadowPop,
+                        borderRadius: "14px",
+                      }}
+                    >
+                      <PopoverBody p="$1" display="flex" flexDirection="column">
+                        <Input
+                          placeholder="Filter folders…"
+                          value={dirFilter()}
+                          onInput={(e) => setDirFilter(e.currentTarget.value)}
+                          size="sm"
+                          mb="$1"
+                          css={{
+                            background: MV.surface,
+                            borderColor: MV.hairline,
+                            color: MV.label,
+                            "&::placeholder": { color: MV.label3 },
+                          }}
+                        />
+                        <Box maxH="50vh" overflowY="auto">
+                          <For each={filteredSubDirs()}>
+                            {(sub) => {
+                              const name = sub.split("/").pop() || sub
+                              return (
+                                <Box
+                                  display="flex"
+                                  alignItems="center"
+                                  gap="$2"
+                                  px="$2"
+                                  py="$1_5"
+                                  rounded="$md"
+                                  cursor="pointer"
+                                  _hover={{ bg: "rgba(0,0,0,0.04)" }}
+                                  onClick={() => {
+                                    onClose()
+                                    setDirFilter("")
+                                    scrollToFolder(sub)
+                                  }}
+                                >
+                                  <Box
+                                    as={AiOutlineFolder}
+                                    boxSize="14px"
+                                    color={MV.accent}
+                                    flexShrink={0}
+                                  />
+                                  <Text
+                                    size="sm"
+                                    color={MV.label}
+                                    css={{ wordBreak: "break-all" }}
+                                  >
+                                    {name}
+                                  </Text>
+                                </Box>
+                              )
+                            }}
+                          </For>
+                          <Show when={filteredSubDirs().length === 0}>
+                            <Text size="xs" color={MV.label3} px="$2" py="$2">
+                              No folders match
+                            </Text>
+                          </Show>
+                        </Box>
+                      </PopoverBody>
+                    </PopoverContent>
+                  </>
+                )}
+              </Popover>
+            </Box>
+          </Show>
         </Show>
       </Box>
 
