@@ -180,7 +180,9 @@ const MV = {
     gif: "#FF9500",
     text: "#5E5CE6",
   } as Record<MediaItem["type"], string>,
-  glassBlur: "blur(20px) saturate(180%)",
+  // blur without saturate: the combined filter was the compositor's most
+  // expensive per-frame cost wherever content scrolls under the glass
+  glassBlur: "blur(16px)",
   shadowCard: "0 1px 2px rgba(0,0,0,0.04), 0 4px 14px rgba(0,0,0,0.05)",
   shadowCardHover: "0 2px 6px rgba(0,0,0,0.05), 0 12px 30px rgba(0,0,0,0.10)",
   shadowPop: "0 2px 8px rgba(0,0,0,0.06), 0 16px 48px rgba(0,0,0,0.16)",
@@ -1185,6 +1187,26 @@ const MediaView = () => {
   /* ─── Lazy text observer: fetch text when a text card scrolls into view ─── */
   let textObserver: IntersectionObserver | undefined
 
+  /* thumb-less video cards only mount their metadata-<video> (first-frame
+     fallback) once the card is near the viewport — a library full of videos
+     with no server thumbnails would otherwise spin up dozens of decoder
+     pipelines at once, which is exactly the "very janky" report */
+  const cardVideoCallbacks = new WeakMap<Element, () => void>()
+  const cardVideoObserver =
+    typeof IntersectionObserver !== "undefined"
+      ? new IntersectionObserver(
+          (entries) => {
+            for (const entry of entries) {
+              if (entry.isIntersecting) {
+                cardVideoCallbacks.get(entry.target)?.()
+                cardVideoObserver?.unobserve(entry.target)
+              }
+            }
+          },
+          { rootMargin: "300px" },
+        )
+      : undefined
+
   onMount(() => {
     textObserver = new IntersectionObserver(
       (entries) => {
@@ -1588,6 +1610,7 @@ const MediaView = () => {
     popGuard()
     abortCtrl?.abort()
     textObserver?.disconnect()
+    cardVideoObserver?.disconnect()
     resizeObserver?.disconnect()
     rowResizeObserver?.disconnect()
     clearTimeout(outTimer)
@@ -1799,6 +1822,24 @@ const MediaView = () => {
             // instead of an empty gray tile
             const [thumbErr, setThumbErr] = createSignal(false)
             const [vidErr, setVidErr] = createSignal(false)
+            // first-frame <video> mounts only when the card is near the
+            // viewport — see cardVideoObserver above
+            const [vidOn, setVidOn] = createSignal(false)
+            let vidGate: HTMLDivElement | undefined
+            // armed in the ref callback, NOT onMount: a video that shows its
+            // thumbnail first has no gate until that image fails — the ref
+            // fires exactly when the placeholder element is (re)created,
+            // whenever that happens
+            const armVidGate = (el: HTMLDivElement) => {
+              vidGate = el
+              if (item.type === "video" && cardVideoObserver) {
+                cardVideoCallbacks.set(el, () => setVidOn(true))
+                cardVideoObserver.observe(el)
+              }
+            }
+            onCleanup(() => {
+              if (vidGate) cardVideoObserver?.unobserve(vidGate)
+            })
             const thumbUrl = () => {
               if (item.type === "gif") return link()
               if (item.type === "image") return item.thumb || link()
@@ -1818,8 +1859,11 @@ const MediaView = () => {
                     fallback={
                       // a video with no server thumbnail shows its own first
                       // frame — a metadata-only <video> needs no canvas and
-                      // no CORS gymnastics, the browser just paints frame 0
-                      item.type === "video" && !vidErr() ? (
+                      // no CORS gymnastics. It mounts only once the card is
+                      // near the viewport (cardVideoObserver): a library of
+                      // thumb-less videos must not spin up every decoder at
+                      // once.
+                      item.type === "video" && vidOn() && !vidErr() ? (
                         <video
                           src={link() + "#t=0.1"}
                           preload="metadata"
@@ -1834,9 +1878,20 @@ const MediaView = () => {
                           }}
                         />
                       ) : (
-                        <Center h="$full">
-                          <TypeIcon type={item.type} />
-                        </Center>
+                        <div
+                          ref={armVidGate}
+                          style={{
+                            display: "flex",
+                            "align-items": "center",
+                            "justify-content": "center",
+                            width: "100%",
+                            height: "100%",
+                          }}
+                        >
+                          <Center h="$full">
+                            <TypeIcon type={item.type} />
+                          </Center>
+                        </div>
                       )
                     }
                   >
@@ -2780,8 +2835,8 @@ const MediaView = () => {
             const feedBarCss = {
               pointerEvents: "none" as const,
               background: "rgba(20,20,22,0.55)",
-              backdropFilter: "blur(16px) saturate(150%)",
-              WebkitBackdropFilter: "blur(16px) saturate(150%)",
+              backdropFilter: "blur(16px)",
+              WebkitBackdropFilter: "blur(16px)",
             }
             let feedWheelAt = 0
 
@@ -4137,8 +4192,8 @@ const MediaView = () => {
             w="min(380px, calc(100vw - 32px))"
             css={{
               background: "rgba(255,255,255,0.86)",
-              backdropFilter: "blur(24px) saturate(180%)",
-              WebkitBackdropFilter: "blur(24px) saturate(180%)",
+              backdropFilter: "blur(20px)",
+              WebkitBackdropFilter: "blur(20px)",
               border: `1px solid ${MV.hairline}`,
               boxShadow: MV.shadowPop,
               color: MV.label,
@@ -4209,8 +4264,8 @@ const MediaView = () => {
             overflowY="auto"
             css={{
               background: "rgba(255,255,255,0.86)",
-              backdropFilter: "blur(24px) saturate(180%)",
-              WebkitBackdropFilter: "blur(24px) saturate(180%)",
+              backdropFilter: "blur(20px)",
+              WebkitBackdropFilter: "blur(20px)",
               border: `1px solid ${MV.hairline}`,
               boxShadow: MV.shadowPop,
               color: MV.label,
