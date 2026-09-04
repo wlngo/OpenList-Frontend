@@ -2674,7 +2674,9 @@ const MediaView = () => {
                   css={{
                     display: "block",
                     maxWidth: "92vw",
-                    maxHeight: "90vh",
+                    // keep the media clear of the chrome band (41px top +
+                    // 71px bottom + breathing room) — no more overlap
+                    maxHeight: "calc(100vh - 128px)",
                     width: "auto",
                     height: "auto",
                     objectFit: "contain",
@@ -2699,7 +2701,7 @@ const MediaView = () => {
                     src={link}
                     alt={it.name}
                     maxW="92%"
-                    maxH="90vh"
+                    maxH="calc(100vh - 128px)"
                     objectFit="contain"
                     rounded="$lg"
                     css={{ boxShadow: MV.shadowStage }}
@@ -2719,7 +2721,7 @@ const MediaView = () => {
                   autoplay={!exiting}
                   muted={exiting}
                   maxW="92%"
-                  maxH="90vh"
+                  maxH="calc(100vh - 128px)"
                   rounded="$lg"
                   onClick={(e: MouseEvent) => e.stopPropagation()}
                   css={{ outline: "none", touchAction: "pan-y" }}
@@ -2732,7 +2734,7 @@ const MediaView = () => {
               return (
                 <Box
                   w="min(800px, 90%)"
-                  maxH="85vh"
+                  maxH="calc(100vh - 148px)"
                   overflowY="auto"
                   bg={MV.surface}
                   rounded="$lg"
@@ -3648,6 +3650,7 @@ const MediaView = () => {
                         alignItems="center"
                         justifyContent="center"
                         zIndex={1}
+                        pb="30px"
                         css={{ pointerEvents: "none" }}
                       >
                         {renderMediaItem(out.item, true)}
@@ -3672,6 +3675,7 @@ const MediaView = () => {
                         display="flex"
                         alignItems="center"
                         justifyContent="center"
+                        pb="30px"
                         zIndex={2}
                       >
                         <Show when={item()}>{renderMediaItem(item()!)}</Show>
