@@ -3822,10 +3822,10 @@ const MediaView = () => {
                         stripRef = el
                       }}
                       display="flex"
-                      gap="$1_5"
+                      gap="$1"
                       overflowX="auto"
                       px="$3"
-                      pt="$2"
+                      pt="$1_5"
                       css={{
                         pointerEvents: "auto",
                         scrollbarWidth: "none",
@@ -3852,8 +3852,8 @@ const MediaView = () => {
                             `mv-fs-cell${i === idx() ? " mv-fs-active" : ""}`
                           // static sizing only (identical for both cell kinds)
                           const cellCss = {
-                            height: "44px",
-                            width: "58px",
+                            height: "36px",
+                            width: "48px",
                             objectFit: "cover" as const,
                             borderRadius: "8px",
                             cursor: "pointer",
@@ -3943,7 +3943,7 @@ const MediaView = () => {
                     alignItems="center"
                     gap="$3"
                     px="$3"
-                    py="$2_5"
+                    py="$1_5"
                   >
                     <Text
                       size="xs"
