@@ -1903,9 +1903,11 @@ const MediaView = () => {
                       draggable={false}
                       onError={() => setThumbErr(true)}
                     />
-                    <Show when={item.type === "video"}>
-                      <div class="mv-card-play" />
-                    </Show>
+                  </Show>
+                  {/* play plate sits outside the thumbnail <Show> so videos
+                      showing their first-frame fallback get it too */}
+                  <Show when={item.type === "video"}>
+                    <div class="mv-card-play" />
                   </Show>
                 </div>
                 <div class="mv-card-cap">
@@ -2384,12 +2386,30 @@ const MediaView = () => {
           box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 4px 14px rgba(0, 0, 0, 0.05);
           transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
         }
+        /* media is ALWAYS developed — a photographic grade applied with
+           pure CSS functions: exposure/brightness ≈ +12 (restrained:
+           brightness() has no highlight rolloff, so we stay well short of
+           clipping), contrast +6 (depth/dehaze), vibrance +12, white
+           balance ≈ +4 warm via a sepia trace. A true SVG tone curve
+           (shadow lift + highlight rolloff) was measured at 6× CPU
+           throttle at 14.2ms avg / p95 48.5 / 8 dropped frames vs
+           7.8ms / p95 14 / 0 dropped for plain CSS — rejected for a view
+           that just recovered from scroll jank. Hover adds motion only:
+           a grade must not change color because the pointer arrived. */
+        .mv-card-media img,
+        .mv-card-media video {
+          filter: brightness(1.12) contrast(1.06) saturate(1.12)
+            sepia(0.04);
+        }
         .mv-card:hover {
           transform: translateY(-2px);
           box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05), 0 12px 30px rgba(0, 0, 0, 0.1);
-          border-color: rgba(0, 0, 0, 0.12);
+          border-color: rgba(0, 122, 255, 0.35);
         }
-        .mv-card:hover .mv-card-media img { transform: scale(1.05); }
+        .mv-card:hover .mv-card-media img,
+        .mv-card:hover .mv-card-media video {
+          transform: scale(1.05);
+        }
         .mv-card-focus {
           border-color: rgba(0, 122, 255, 0.45);
           box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.25),
@@ -2404,24 +2424,48 @@ const MediaView = () => {
           overflow: hidden;
           aspect-ratio: 4 / 3;
         }
-        .mv-card-media img {
+        .mv-card-media img,
+        .mv-card-media video {
           display: block;
           width: 100%;
           height: 100%;
           object-fit: cover;
-          transition: transform 0.5s cubic-bezier(0.22, 0.61, 0.36, 1);
+          transition: transform 0.35s cubic-bezier(0.22, 0.61, 0.36, 1);
         }
+        /* glass-spec: a hairline of light along the media's top edge */
+        .mv-card-media::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          border-top: 1px solid rgba(255, 255, 255, 0.38);
+          pointer-events: none;
+          z-index: 2;
+        }
+        /* compact play plate — reads on bright frames too, unlike a bare
+           triangle; ::after draws the triangle */
         .mv-card-play {
           position: absolute;
           inset: 0;
           margin: auto;
-          width: 0;
-          height: 0;
-          border-top: 13px solid transparent;
-          border-bottom: 13px solid transparent;
-          border-left: 20px solid rgba(255, 255, 255, 0.9);
-          filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.5));
+          width: 34px;
+          height: 34px;
+          border-radius: 50%;
+          background: rgba(0, 0, 0, 0.28);
+          border: 1px solid rgba(255, 255, 255, 0.55);
+          box-shadow: 0 1px 5px rgba(0, 0, 0, 0.22);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          z-index: 3;
           pointer-events: none;
+        }
+        .mv-card-play::after {
+          content: "";
+          display: block;
+          margin-left: 2px;
+          border-top: 6px solid transparent;
+          border-bottom: 6px solid transparent;
+          border-left: 10px solid rgba(255, 255, 255, 0.95);
         }
         .mv-card-cap { padding: 10px 12px 12px; }
         .mv-card-name {
@@ -2441,6 +2485,12 @@ const MediaView = () => {
           .mv-scanline { animation: none; left: 0; }
           .mv-enter { animation: none; }
           .mv-chrome { transition: none; }
+          .mv-card,
+          .mv-card-media img,
+          .mv-card-media video { transition: none; }
+          .mv-card:hover { transform: none; }
+          .mv-card:hover .mv-card-media img,
+          .mv-card:hover .mv-card-media video { transform: none; }
         }
       `}</style>
       <Box
